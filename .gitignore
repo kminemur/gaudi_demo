@@ -1,5 +1,6 @@
 .venv/
 hf_cache/
 habanalabs-installer-log/
+hqt_output/
 __pycache__/
 *.pyc

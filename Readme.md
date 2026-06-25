@@ -1,6 +1,52 @@
 # Gaudi demo
 
-Run Qwen/Qwen3.6-27B on Intel Gaudi HPU.
+Run Qwen models on Intel Gaudi HPU. The chat server defaults to
+`Qwen/Qwen3.6-35B-A3B-FP8`.
+
+## Chat UI
+
+Start a web chat server bound to all interfaces:
+
+```bash
+HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python chat_server.py \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+Then open `http://<server-ip>:8000/`.
+
+The UI can switch between:
+
+- `Qwen/Qwen3.6-35B-A3B-FP8`
+- `Qwen/Qwen3.6-27B`
+- `Qwen/Qwen3-32B`
+
+The reasoning strength selector changes the speed/depth tradeoff:
+
+- `Low`: shortest responses, fastest, thinking disabled
+- `Medium`: standard responses, thinking disabled
+- `High`: longer responses, thinking enabled
+
+The agent mode selector is applied per message:
+
+- `Chat`: answer with the selected model only
+- `Web検索`: search the web once, then answer with sources
+- `Deep search`: run multiple searches, then answer with broader source context
+
+When you choose a different model, the server unloads the current model and loads
+the selected one on the next chat request.
+
+`Qwen/Qwen3.6-35B-A3B-FP8` uses the pretrained FP8 weights from Hugging Face.
+The bf16 models remain available in the model selector.
+
+```bash
+HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python chat_server.py \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --model-id Qwen/Qwen3.6-27B
+```
+
+## CLI
 
 ```bash
 HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python run_qwen36_hpu.py \
