@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import base64
+import uuid
 from contextlib import asynccontextmanager
 from typing import Literal
 from urllib.parse import quote_plus, unquote, urlparse, parse_qs
@@ -19,12 +20,22 @@ import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor, AutoTokenizer, TextIteratorStreamer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    AutoTokenizer,
+    StoppingCriteria,
+    StoppingCriteriaList,
+    TextIteratorStreamer,
+)
 
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3.6-35B-A3B-FP8"
 SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
+SEARCH_ENGINE = os.environ.get("SEARCH_ENGINE", "duckduckgo")
+SEARCH_TIMEOUT_SEC = float(os.environ.get("SEARCH_TIMEOUT_SEC", "8"))
 MODEL_SPECS = {
     "Qwen/Qwen3.6-35B-A3B-FP8": {
         "label": "Qwen3.6 35B A3B FP8",
@@ -206,6 +217,50 @@ HTML = """<!doctype html>
       padding-left: 4px;
     }
 
+    .steps {
+      align-self: flex-start;
+      width: min(760px, 92%);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfbf9;
+      padding: 10px 12px;
+      color: var(--muted);
+      font-size: 13px;
+      display: grid;
+      gap: 7px;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 18px 1fr;
+      gap: 8px;
+      align-items: start;
+      line-height: 1.35;
+    }
+
+    .step-marker {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      margin-top: 4px;
+      background: #c8ccd2;
+    }
+
+    .step.active .step-marker { background: #f59e0b; }
+    .step.done .step-marker { background: #16a34a; }
+    .step.error .step-marker { background: #dc2626; }
+
+    .step-title {
+      color: var(--ink);
+      font-weight: 640;
+    }
+
+    .step-detail {
+      font-size: 12px;
+      margin-top: 2px;
+      overflow-wrap: anywhere;
+    }
+
     form {
       border-top: 1px solid var(--line);
       padding: 14px;
@@ -249,6 +304,13 @@ HTML = """<!doctype html>
 
     button:hover { background: var(--accent-strong); }
     button:disabled { cursor: not-allowed; opacity: 0.62; }
+
+    button.cancel {
+      background: #b91c1c;
+      border-color: #b91c1c;
+    }
+
+    button.cancel:hover { background: #991b1b; }
 
     select {
       padding: 0 10px;
@@ -312,6 +374,19 @@ HTML = """<!doctype html>
     const statusText = document.querySelector("#statusText");
     const precisionText = document.querySelector("#precisionText");
     const history = [];
+    let activeRequestId = null;
+    let activeController = null;
+    let isRunning = false;
+
+    async function cancelActiveRequest() {
+      if (!activeRequestId) return;
+      sendEl.disabled = true;
+      setStatus("cancelling", "busy");
+      try {
+        await fetch(`/api/cancel/${encodeURIComponent(activeRequestId)}`, { method: "POST" });
+      } catch {}
+      if (activeController) activeController.abort();
+    }
 
     function setStatus(text, state) {
       statusText.textContent = text;
@@ -344,6 +419,49 @@ HTML = """<!doctype html>
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
 
+    function addStepPanel() {
+      const node = document.createElement("div");
+      node.className = "steps";
+      node.textContent = "準備中...";
+      messagesEl.appendChild(node);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      return node;
+    }
+
+    function renderSteps(node, steps) {
+      if (!steps || steps.length === 0) {
+        node.textContent = "準備中...";
+        return;
+      }
+      node.textContent = "";
+      for (const step of steps) {
+        const row = document.createElement("div");
+        row.className = `step ${step.status}`;
+        const marker = document.createElement("span");
+        marker.className = "step-marker";
+        const body = document.createElement("div");
+        const title = document.createElement("div");
+        title.className = "step-title";
+        title.textContent = step.label;
+        body.appendChild(title);
+        if (step.detail) {
+          const detail = document.createElement("div");
+          detail.className = "step-detail";
+          detail.textContent = step.detail;
+          body.appendChild(detail);
+        }
+        row.appendChild(marker);
+        row.appendChild(body);
+        node.appendChild(row);
+      }
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function makeRequestId() {
+      if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+      return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+
     async function refreshHealth() {
       try {
         const res = await fetch("/api/health");
@@ -358,22 +476,43 @@ HTML = """<!doctype html>
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (isRunning) {
+        await cancelActiveRequest();
+        return;
+      }
       const prompt = promptEl.value.trim();
       if (!prompt) return;
 
       promptEl.value = "";
-      sendEl.disabled = true;
+      isRunning = true;
+      sendEl.textContent = "キャンセル";
+      sendEl.classList.add("cancel");
       setStatus("generating", "busy");
       addMessage("user", prompt);
       history.push({ role: "user", content: prompt });
       const modeLabel = agentModeEl.options[agentModeEl.selectedIndex].textContent;
+      const requestId = makeRequestId();
+      activeRequestId = requestId;
+      activeController = new AbortController();
       const assistantNode = addMessage("assistant", agentModeEl.value === "chat" ? "生成中..." : `${modeLabel} 中...`);
+      const stepsNode = addStepPanel();
+      const stepPoll = setInterval(async () => {
+        try {
+          const res = await fetch(`/api/agent_steps/${encodeURIComponent(requestId)}`);
+          if (!res.ok) return;
+          const data = await res.json();
+          renderSteps(stepsNode, data.steps);
+          if (data.done) clearInterval(stepPoll);
+        } catch {}
+      }, 750);
 
       try {
         const res = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          signal: activeController.signal,
           body: JSON.stringify({
+            request_id: requestId,
             messages: history,
             model_id: modelEl.value,
             reasoning_effort: reasoningEl.value,
@@ -388,10 +527,28 @@ HTML = """<!doctype html>
         history.push({ role: "assistant", content: data.reply || "" });
         setStatus("ready", "ready");
       } catch (error) {
-        assistantNode.textContent = `エラー: ${error.message}`;
-        setStatus("error", "");
+        if (error.name === "AbortError") {
+          assistantNode.textContent = "キャンセルしました。";
+          setStatus("cancelled", "");
+        } else {
+          assistantNode.textContent = `エラー: ${error.message}`;
+          setStatus("error", "");
+        }
       } finally {
+        clearInterval(stepPoll);
+        try {
+          const res = await fetch(`/api/agent_steps/${encodeURIComponent(requestId)}`);
+          if (res.ok) {
+            const data = await res.json();
+            renderSteps(stepsNode, data.steps);
+          }
+        } catch {}
         sendEl.disabled = false;
+        sendEl.textContent = "送信";
+        sendEl.classList.remove("cancel");
+        isRunning = false;
+        activeRequestId = null;
+        activeController = null;
         promptEl.focus();
       }
     });
@@ -442,6 +599,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    request_id: str | None = None
     model_id: str = DEFAULT_MODEL_ID
     messages: list[ChatMessage] = Field(min_length=1)
     reasoning_effort: Literal["low", "medium", "high"] = "medium"
@@ -462,18 +620,41 @@ class SearchResult(BaseModel):
     snippet: str
 
 
+class SearchBundle(BaseModel):
+    sources: list[SearchResult] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class AgentStep(BaseModel):
+    label: str
+    status: Literal["pending", "active", "done", "error"]
+    detail: str = ""
+
+
 class ChatResponse(BaseModel):
     reply: str
     precision: str
     reasoning_effort: str
     agent_mode: str
-    sources: list[SearchResult] = []
+    sources: list[SearchResult] = Field(default_factory=list)
     effective_max_new_tokens: int
     enable_thinking: bool
     elapsed_sec: float
     ttft_sec: float
     tokens_per_sec: float
     generated_tokens: int
+
+
+class RequestCancelled(Exception):
+    pass
+
+
+class CancelStoppingCriteria(StoppingCriteria):
+    def __init__(self, cancel_event: threading.Event | None) -> None:
+        self.cancel_event = cancel_event
+
+    def __call__(self, input_ids, scores, **kwargs) -> bool:
+        return bool(self.cancel_event and self.cancel_event.is_set())
 
 
 def normalize_duckduckgo_url(url: str) -> str:
@@ -502,15 +683,31 @@ def strip_tags(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-def web_search(query: str, limit: int = 5) -> list[SearchResult]:
-    url = f"https://r.jina.ai/http://www.bing.com/search?q={quote_plus(query)}"
-    response = requests.get(
-        url,
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=12,
+def parse_duckduckgo_results(body: str, limit: int) -> list[SearchResult]:
+    pattern = re.compile(
+        r"(?:^|\n)\s*(?:\d+\.?\s*)?\[(?P<title>[^\]\n]+)\]\((?P<url>https?://[^)]+)\)"
+        r"(?P<snippet>[^\n]*)",
+        re.DOTALL,
     )
-    response.raise_for_status()
-    body = response.text
+    results = []
+    seen = set()
+    for match in pattern.finditer(body):
+        title = strip_tags(match.group("title"))
+        result_url = normalize_duckduckgo_url(html.unescape(match.group("url")))
+        snippet = strip_tags(match.group("snippet"))
+        parsed = urlparse(result_url)
+        if not title or not parsed.netloc or "duckduckgo.com" in parsed.netloc:
+            continue
+        if result_url in seen:
+            continue
+        seen.add(result_url)
+        results.append(SearchResult(title=title, url=result_url, snippet=snippet))
+        if len(results) >= limit:
+            break
+    return results
+
+
+def parse_bing_results(body: str, limit: int) -> list[SearchResult]:
     pattern = re.compile(
         r"\n\d+\.\s+## \[(?P<title>.*?)\]\((?P<url>.*?)\)\n\n(?P<snippet>.*?)(?=\n\d+\.\s+## |\Z)",
         re.DOTALL,
@@ -534,6 +731,24 @@ def web_search(query: str, limit: int = 5) -> list[SearchResult]:
     return results
 
 
+def web_search(query: str, limit: int = 5) -> list[SearchResult]:
+    engine = SEARCH_ENGINE.lower()
+    if engine == "bing":
+        url = f"https://r.jina.ai/http://www.bing.com/search?q={quote_plus(query)}"
+    else:
+        url = f"https://r.jina.ai/http://lite.duckduckgo.com/lite/?q={quote_plus(query)}"
+    response = requests.get(
+        url,
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=SEARCH_TIMEOUT_SEC,
+    )
+    response.raise_for_status()
+    body = response.text
+    if engine == "bing":
+        return parse_bing_results(body, limit)
+    return parse_duckduckgo_results(body, limit)
+
+
 def search_queries(prompt: str, mode: str) -> list[str]:
     if mode == "web":
         return [prompt]
@@ -544,22 +759,32 @@ def search_queries(prompt: str, mode: str) -> list[str]:
     ]
 
 
-def collect_sources(prompt: str, mode: str) -> list[SearchResult]:
+def collect_sources(prompt: str, mode: str, cancel_event: threading.Event | None = None) -> SearchBundle:
     if mode == "chat":
-        return []
+        return SearchBundle()
     sources = []
+    warnings = []
     seen = set()
     per_query = 4 if mode == "deep" else 5
     max_sources = 8 if mode == "deep" else 5
     for query in search_queries(prompt, mode):
-        for result in web_search(query, limit=per_query):
+        if cancel_event and cancel_event.is_set():
+            raise RequestCancelled()
+        try:
+            results = web_search(query, limit=per_query)
+        except requests.RequestException as exc:
+            warnings.append(f"{query}: {exc}")
+            continue
+        for result in results:
+            if cancel_event and cancel_event.is_set():
+                raise RequestCancelled()
             if result.url in seen:
                 continue
             seen.add(result.url)
             sources.append(result)
             if len(sources) >= max_sources:
-                return sources
-    return sources
+                return SearchBundle(sources=sources, warnings=warnings)
+    return SearchBundle(sources=sources, warnings=warnings)
 
 
 def request_with_sources(request: ChatRequest, sources: list[SearchResult]) -> ChatRequest:
@@ -672,12 +897,21 @@ class ChatEngine:
             return self.tokenizer(text=[text], return_tensors="pt")
         return self.tokenizer([text], return_tensors="pt")
 
-    def generate(self, request: ChatRequest, sources: list[SearchResult] | None = None) -> ChatResponse:
+    def generate(
+        self,
+        request: ChatRequest,
+        sources: list[SearchResult] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> ChatResponse:
         sources = sources or []
         with self.lock:
+            if cancel_event and cancel_event.is_set():
+                raise RequestCancelled()
             self.load(request.model_id)
             assert self.tokenizer is not None
             assert self.model is not None
+            if cancel_event and cancel_event.is_set():
+                raise RequestCancelled()
 
             text = self.render_prompt(request)
             inputs = self.tokenize(text)
@@ -703,6 +937,7 @@ class ChatEngine:
                             temperature=request.temperature if do_sample else None,
                             top_p=request.top_p if do_sample else None,
                             pad_token_id=self.eos_token_id(),
+                            stopping_criteria=StoppingCriteriaList([CancelStoppingCriteria(cancel_event)]),
                             streamer=streamer,
                         )
                         htcore.mark_step()
@@ -722,6 +957,8 @@ class ChatEngine:
 
             if generation_error:
                 raise generation_error["error"]
+            if cancel_event and cancel_event.is_set():
+                raise RequestCancelled()
 
             finished = time.time()
             output_ids = generated_output["output_ids"]
@@ -788,6 +1025,50 @@ def package_version(name: str) -> str:
 
 def create_app(model_id: str) -> FastAPI:
     engine = ChatEngine(model_id)
+    progress_lock = threading.Lock()
+    agent_progress: dict[str, dict] = {}
+    cancel_events: dict[str, threading.Event] = {}
+
+    def request_key(request_id: str | None) -> str:
+        return request_id or str(uuid.uuid4())
+
+    def set_steps(request_id: str, steps: list[AgentStep], done: bool = False) -> None:
+        with progress_lock:
+            agent_progress[request_id] = {
+                "steps": [step.model_dump() for step in steps],
+                "done": done,
+                "updated_at": time.time(),
+            }
+
+    def cancel_event_for(request_id: str) -> threading.Event:
+        with progress_lock:
+            event = cancel_events.get(request_id)
+            if event is None:
+                event = threading.Event()
+                cancel_events[request_id] = event
+            return event
+
+    def update_step(
+        request_id: str,
+        steps: list[AgentStep],
+        index: int,
+        status: Literal["pending", "active", "done", "error"],
+        detail: str = "",
+        done: bool = False,
+    ) -> None:
+        steps[index].status = status
+        steps[index].detail = detail
+        set_steps(request_id, steps, done=done)
+
+    def initial_steps(mode: str) -> list[AgentStep]:
+        steps = [AgentStep(label="リクエスト受付", status="done", detail=AGENT_MODES[mode]["label"])]
+        if mode in {"web", "deep"}:
+            steps.append(AgentStep(label="Web検索", status="pending"))
+            steps.append(AgentStep(label="検索結果の整理", status="pending"))
+        steps.append(AgentStep(label="プロンプト作成", status="pending"))
+        steps.append(AgentStep(label="モデル生成", status="pending"))
+        steps.append(AgentStep(label="応答完了", status="pending"))
+        return steps
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -813,6 +1094,8 @@ def create_app(model_id: str) -> FastAPI:
             "models": MODEL_SPECS,
             "reasoning_presets": REASONING_PRESETS,
             "agent_modes": AGENT_MODES,
+            "search_engine": SEARCH_ENGINE.lower(),
+            "search_timeout_sec": SEARCH_TIMEOUT_SEC,
             "active_model_id": engine.active_model_id,
             "model_loaded": engine.is_loaded,
             "precision": engine.precision,
@@ -822,23 +1105,105 @@ def create_app(model_id: str) -> FastAPI:
             "loaded_at": engine.loaded_at,
         }
 
+    @app.get("/api/agent_steps/{request_id}")
+    def agent_steps(request_id: str) -> dict:
+        with progress_lock:
+            record = agent_progress.get(request_id)
+        if record is None:
+            return {"steps": [], "done": False}
+        return {"steps": record["steps"], "done": record["done"], "updated_at": record["updated_at"]}
+
+    @app.post("/api/cancel/{request_id}")
+    def cancel_request(request_id: str) -> dict:
+        event = cancel_event_for(request_id)
+        event.set()
+        with progress_lock:
+            record = agent_progress.get(request_id)
+        if record:
+            steps = [AgentStep(**step) for step in record["steps"]]
+            for step in steps:
+                if step.status == "active":
+                    step.status = "error"
+                    step.detail = "キャンセルされました"
+            if steps:
+                steps[-1].status = "error"
+                steps[-1].detail = "ユーザーがリクエストをキャンセルしました"
+            set_steps(request_id, steps, done=True)
+        return {"cancelled": True, "request_id": request_id}
+
     @app.post("/api/chat", response_model=ChatResponse)
     def chat(request: ChatRequest) -> ChatResponse:
+        request_id = request_key(request.request_id)
+        cancel_event = cancel_event_for(request_id)
+        cancel_event.clear()
+        steps = initial_steps(request.agent_mode)
+        set_steps(request_id, steps)
         try:
             if engine.is_loaded and engine.active_model_id != request.model_id:
                 raise HTTPException(
                     status_code=409,
                     detail="Select the model in the UI first. The server restarts to switch models cleanly.",
                 )
-            sources = collect_sources(request.messages[-1].content, request.agent_mode)
+            cursor = 1
+            if request.agent_mode in {"web", "deep"}:
+                update_step(request_id, steps, cursor, "active", "検索クエリを実行しています")
+                search_bundle = collect_sources(
+                    request.messages[-1].content,
+                    request.agent_mode,
+                    cancel_event=cancel_event,
+                )
+                sources = search_bundle.sources
+                if search_bundle.warnings:
+                    detail = f"{len(sources)} 件取得。一部検索失敗: {len(search_bundle.warnings)} 件"
+                else:
+                    detail = f"{len(sources)} 件の候補を取得"
+                update_step(request_id, steps, cursor, "done", detail)
+                cursor += 1
+                update_step(request_id, steps, cursor, "active", "モデルへ渡す根拠を整えています")
+                if cancel_event.is_set():
+                    raise RequestCancelled()
+                if sources:
+                    update_step(request_id, steps, cursor, "done", f"{min(len(sources), 8)} 件をコンテキスト化")
+                else:
+                    update_step(request_id, steps, cursor, "done", "検索結果なし。通常プロンプトで続行")
+                cursor += 1
+            else:
+                sources = []
+            update_step(request_id, steps, cursor, "active", "会話履歴とエージェント結果を結合しています")
+            if cancel_event.is_set():
+                raise RequestCancelled()
             enriched_request = request_with_sources(request, sources)
-            return engine.generate(enriched_request, sources=sources)
+            update_step(request_id, steps, cursor, "done", "生成用プロンプトを作成")
+            cursor += 1
+            update_step(request_id, steps, cursor, "active", "HPU 上のモデルで生成しています")
+            return engine.generate(enriched_request, sources=sources, cancel_event=cancel_event)
         except HTTPException:
+            update_step(request_id, steps, len(steps) - 1, "error", "リクエストを完了できませんでした", done=True)
             raise
+        except RequestCancelled as exc:
+            for step in steps:
+                if step.status == "active":
+                    step.status = "error"
+                    step.detail = "キャンセルされました"
+            steps[-1].status = "error"
+            steps[-1].detail = "ユーザーがリクエストをキャンセルしました"
+            set_steps(request_id, steps, done=True)
+            raise HTTPException(status_code=499, detail="Request cancelled") from exc
         except requests.RequestException as exc:
+            update_step(request_id, steps, len(steps) - 1, "error", f"Web検索に失敗しました: {exc}", done=True)
             raise HTTPException(status_code=502, detail=f"Web search failed: {exc}") from exc
         except Exception as exc:
+            update_step(request_id, steps, len(steps) - 1, "error", str(exc), done=True)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        finally:
+            with progress_lock:
+                record = agent_progress.get(request_id)
+            if record and not record["done"]:
+                steps[-2].status = "done"
+                steps[-2].detail = "生成が完了しました"
+                steps[-1].status = "done"
+                steps[-1].detail = "ブラウザへ応答を返しました"
+                set_steps(request_id, steps, done=True)
 
     @app.post("/api/switch_model")
     def switch_model(request: SwitchModelRequest) -> dict:

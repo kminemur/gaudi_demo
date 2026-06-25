@@ -30,8 +30,16 @@ The reasoning strength selector changes the speed/depth tradeoff:
 The agent mode selector is applied per message:
 
 - `Chat`: answer with the selected model only
-- `Web検索`: search the web once, then answer with sources
-- `Deep search`: run multiple searches, then answer with broader source context
+- `Web検索`: search DuckDuckGo once, then answer with sources
+- `Deep search`: run multiple DuckDuckGo searches, then answer with broader source context
+
+DuckDuckGo is the default search engine. To temporarily switch back to Bing,
+start the server with `SEARCH_ENGINE=bing`.
+
+While a message is running, the UI shows agent steps such as web search,
+source preparation, prompt construction, model generation, and completion.
+Use the cancel button to stop the active request; the server marks the request as
+cancelled and asks generation to stop at the next token boundary.
 
 When you choose a different model, the server unloads the current model and loads
 the selected one on the next chat request.
