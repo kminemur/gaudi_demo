@@ -1,0 +1,5 @@
+.venv/
+hf_cache/
+habanalabs-installer-log/
+__pycache__/
+*.pyc
