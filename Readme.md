@@ -1,7 +1,7 @@
 # Gaudi demo
 
 Run Qwen models on Intel Gaudi HPU. The chat server defaults to
-`Qwen/Qwen3.6-35B-A3B-FP8`.
+`Qwen/Qwen3.6-27B`.
 
 ## Chat UI
 
@@ -15,10 +15,13 @@ HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python chat_server.py \
 
 Then open `http://<server-ip>:8000/`.
 
+The first screen asks for a user name. Each user gets a separate chat screen and
+history, saved in `chat_history.json`.
+
 The UI can switch between:
 
-- `Qwen/Qwen3.6-35B-A3B-FP8`
 - `Qwen/Qwen3.6-27B`
+- `Qwen/Qwen3.6-35B-A3B-FP8`
 - `Qwen/Qwen3-32B`
 
 The reasoning strength selector changes the speed/depth tradeoff:
@@ -45,7 +48,19 @@ When you choose a different model, the server unloads the current model and load
 the selected one on the next chat request.
 
 `Qwen/Qwen3.6-35B-A3B-FP8` uses the pretrained FP8 weights from Hugging Face.
-The bf16 models remain available in the model selector.
+It remains available in the model selector alongside the default 27B bf16 model.
+
+## Performance notes
+
+The built-in FastAPI server uses Transformers directly on a single HPU. On an
+8-card Gaudi2 host this leaves the other HPUs idle; use vLLM for Intel Gaudi or
+DeepSpeed/Optimum Habana tensor parallel inference for production throughput.
+
+`Qwen/Qwen3.6-35B-A3B-FP8` currently emits a Transformers warning that the FP8
+checkpoint is dequantized to bf16 on this HPU path, so it should not be treated
+as full FP8 compute. The server enables Habana inference settings, int32 token
+inputs, and KV cache explicitly, but the main remaining bottleneck is the
+single-HPU Transformers execution path.
 
 ```bash
 HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python chat_server.py \

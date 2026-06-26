@@ -3,6 +3,7 @@ import argparse
 import gc
 import html
 import importlib.metadata
+import json
 import os
 import re
 import sys
@@ -11,8 +12,15 @@ import time
 import base64
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 from urllib.parse import quote_plus, unquote, urlparse, parse_qs
+
+# These must be set before importing torch / habana_frameworks. Lazy mode can be
+# faster for some LLMs, but this Qwen MoE FP8 checkpoint currently fails during
+# startup in lazy mode, so keep eager as the default and allow env overrides.
+os.environ.setdefault("PT_HPU_LAZY_MODE", "0")
 
 import torch
 import habana_frameworks.torch.core as htcore
@@ -31,11 +39,15 @@ from transformers import (
 )
 
 
-DEFAULT_MODEL_ID = "Qwen/Qwen3.6-35B-A3B-FP8"
+DEFAULT_MODEL_ID = "Qwen/Qwen3.6-27B"
 SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
+HISTORY_PATH = Path(os.environ.get("CHAT_HISTORY_PATH", "chat_history.json"))
 SEARCH_ENGINE = os.environ.get("SEARCH_ENGINE", "duckduckgo")
 SEARCH_TIMEOUT_SEC = float(os.environ.get("SEARCH_TIMEOUT_SEC", "8"))
+HPU_EXECUTION_MODE = "lazy" if os.environ.get("PT_HPU_LAZY_MODE") == "1" else "eager"
+USE_INT32_INPUTS = os.environ.get("USE_INT32_INPUTS", "1") == "1"
+MODEL_PLACEMENT = "single_hpu_transformers"
 MODEL_SPECS = {
     "Qwen/Qwen3.6-35B-A3B-FP8": {
         "label": "Qwen3.6 35B A3B FP8",
@@ -148,6 +160,72 @@ HTML = """<!doctype html>
       white-space: nowrap;
     }
 
+    .login-view {
+      min-height: 420px;
+      display: grid;
+      place-items: center;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 24px;
+    }
+
+    .login-panel {
+      width: min(420px, 100%);
+      display: grid;
+      gap: 14px;
+    }
+
+    .login-title {
+      font-size: 18px;
+      font-weight: 720;
+    }
+
+    .login-error {
+      min-height: 20px;
+      color: #b91c1c;
+      font-size: 13px;
+    }
+
+    .sessionbar {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 10px;
+      align-items: center;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfbf9;
+    }
+
+    .session-user {
+      color: var(--muted);
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }
+
+    .field {
+      display: grid;
+      gap: 5px;
+    }
+
+    label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    input {
+      width: 100%;
+      height: 44px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0 12px;
+      font: inherit;
+      color: var(--ink);
+      background: #fff;
+    }
+
     .dot {
       width: 8px;
       height: 8px;
@@ -168,6 +246,8 @@ HTML = """<!doctype html>
       box-shadow: var(--shadow);
       overflow: hidden;
     }
+
+    .hidden { display: none !important; }
 
     #messages {
       flex: 1;
@@ -261,7 +341,7 @@ HTML = """<!doctype html>
       overflow-wrap: anywhere;
     }
 
-    form {
+    #chatForm {
       border-top: 1px solid var(--line);
       padding: 14px;
       display: grid;
@@ -312,6 +392,16 @@ HTML = """<!doctype html>
 
     button.cancel:hover { background: #991b1b; }
 
+    button.secondary {
+      color: var(--ink);
+      background: #fff;
+      border-color: var(--line);
+    }
+
+    button.secondary:hover {
+      background: #f2f3f0;
+    }
+
     select {
       padding: 0 10px;
       background: #fff;
@@ -321,8 +411,9 @@ HTML = """<!doctype html>
     @media (max-width: 720px) {
       .app { padding: 10px; }
       header { align-items: flex-start; flex-direction: column; }
+      .sessionbar { grid-template-columns: 1fr; }
       #messages { min-height: 360px; padding: 12px; }
-      form { grid-template-columns: 1fr; }
+      #chatForm { grid-template-columns: 1fr; }
       button, select { width: 100%; }
       .message { max-width: 100%; }
     }
@@ -335,15 +426,33 @@ HTML = """<!doctype html>
       <div class="status"><span id="dot" class="dot"></span><span id="statusText">接続確認中</span><span id="precisionText"></span></div>
     </header>
 
-    <main>
+    <section id="loginView" class="login-view">
+      <form id="loginForm" class="login-panel">
+        <div class="login-title">ログイン</div>
+        <div class="field">
+          <label for="loginName">ユーザー名</label>
+          <input id="loginName" autocomplete="username" placeholder="例: kazuki" autofocus />
+        </div>
+        <button id="loginButton" type="submit">ログイン</button>
+        <div id="loginError" class="login-error"></div>
+      </form>
+    </section>
+
+    <main id="chatView" class="hidden">
+      <div class="sessionbar">
+        <div class="session-user">ログイン中: <strong id="currentUserName"></strong></div>
+        <button id="clearHistory" class="secondary" type="button">履歴削除</button>
+        <button id="logout" class="secondary" type="button">ログアウト</button>
+      </div>
+
       <div id="messages">
         <div class="message system">選択した Qwen モデルが Intel Gaudi HPU 上で応答します。</div>
       </div>
 
       <form id="chatForm">
         <select id="model" aria-label="model">
+          <option value="Qwen/Qwen3.6-27B" selected>Qwen3.6 27B</option>
           <option value="Qwen/Qwen3.6-35B-A3B-FP8">Qwen3.6 35B A3B FP8</option>
-          <option value="Qwen/Qwen3.6-27B">Qwen3.6 27B</option>
           <option value="Qwen/Qwen3-32B">Qwen3 32B</option>
         </select>
         <select id="reasoning" aria-label="reasoning strength">
@@ -370,13 +479,24 @@ HTML = """<!doctype html>
     const modelEl = document.querySelector("#model");
     const reasoningEl = document.querySelector("#reasoning");
     const agentModeEl = document.querySelector("#agentMode");
+    const loginViewEl = document.querySelector("#loginView");
+    const chatViewEl = document.querySelector("#chatView");
+    const loginFormEl = document.querySelector("#loginForm");
+    const loginNameEl = document.querySelector("#loginName");
+    const loginErrorEl = document.querySelector("#loginError");
+    const currentUserNameEl = document.querySelector("#currentUserName");
+    const clearHistoryEl = document.querySelector("#clearHistory");
+    const logoutEl = document.querySelector("#logout");
     const dotEl = document.querySelector("#dot");
     const statusText = document.querySelector("#statusText");
     const precisionText = document.querySelector("#precisionText");
     const history = [];
+    const defaultSystemMessage = "選択した Qwen モデルが Intel Gaudi HPU 上で応答します。";
     let activeRequestId = null;
     let activeController = null;
     let isRunning = false;
+    let currentUserId = sessionStorage.getItem("gaudiChatUserId") || "";
+    let currentDisplayName = sessionStorage.getItem("gaudiChatDisplayName") || "";
 
     async function cancelActiveRequest() {
       if (!activeRequestId) return;
@@ -400,6 +520,55 @@ HTML = """<!doctype html>
       messagesEl.appendChild(node);
       messagesEl.scrollTop = messagesEl.scrollHeight;
       return node;
+    }
+
+    function renderConversation(messages) {
+      history.length = 0;
+      messagesEl.innerHTML = "";
+      addMessage("system", defaultSystemMessage);
+      for (const message of messages || []) {
+        if (message.role !== "user" && message.role !== "assistant") continue;
+        history.push({ role: message.role, content: message.content });
+        addMessage(message.role, message.content);
+      }
+    }
+
+    function showLogin() {
+      chatViewEl.classList.add("hidden");
+      loginViewEl.classList.remove("hidden");
+      loginNameEl.value = currentDisplayName || "";
+      loginNameEl.focus();
+    }
+
+    function showChat() {
+      loginViewEl.classList.add("hidden");
+      chatViewEl.classList.remove("hidden");
+      currentUserNameEl.textContent = currentDisplayName || currentUserId;
+      promptEl.focus();
+    }
+
+    async function loadHistory(userId) {
+      const res = await fetch(`/api/history/${encodeURIComponent(userId)}`);
+      const data = await res.json();
+      renderConversation(data.messages);
+      currentDisplayName = data.display_name;
+      currentUserNameEl.textContent = currentDisplayName;
+    }
+
+    async function login(displayName) {
+      const res = await fetch("/api/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ display_name: displayName })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "ログインできませんでした");
+      currentUserId = data.user_id;
+      currentDisplayName = data.display_name;
+      sessionStorage.setItem("gaudiChatUserId", currentUserId);
+      sessionStorage.setItem("gaudiChatDisplayName", currentDisplayName);
+      await loadHistory(currentUserId);
+      showChat();
     }
 
     function addMetrics(data) {
@@ -462,13 +631,37 @@ HTML = """<!doctype html>
       return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     }
 
+    function syncModelOptions(data) {
+      const selectedModel = data.active_model_id || data.default_model_id || modelEl.value;
+      const models = data.models || {};
+      const orderedModelIds = Object.keys(models).sort((left, right) => {
+        if (left === selectedModel) return -1;
+        if (right === selectedModel) return 1;
+        if (left === data.default_model_id) return -1;
+        if (right === data.default_model_id) return 1;
+        return (models[left].label || left).localeCompare(models[right].label || right);
+      });
+      if (orderedModelIds.length === 0) {
+        if (selectedModel) modelEl.value = selectedModel;
+        return;
+      }
+      modelEl.innerHTML = "";
+      for (const modelId of orderedModelIds) {
+        const option = document.createElement("option");
+        option.value = modelId;
+        option.textContent = models[modelId].label || modelId;
+        modelEl.appendChild(option);
+      }
+      modelEl.value = selectedModel;
+    }
+
     async function refreshHealth() {
       try {
         const res = await fetch("/api/health");
         const data = await res.json();
         setStatus(data.model_loaded ? "ready" : "loading", data.model_loaded ? "ready" : "busy");
         precisionText.textContent = data.precision ? `· ${data.precision.toUpperCase()}` : "";
-        if (data.active_model_id) modelEl.value = data.active_model_id;
+        syncModelOptions(data);
       } catch {
         setStatus("offline", "");
       }
@@ -513,6 +706,7 @@ HTML = """<!doctype html>
           signal: activeController.signal,
           body: JSON.stringify({
             request_id: requestId,
+            user_id: currentUserId,
             messages: history,
             model_id: modelEl.value,
             reasoning_effort: reasoningEl.value,
@@ -554,8 +748,6 @@ HTML = """<!doctype html>
     });
 
     modelEl.addEventListener("change", () => {
-      history.length = 0;
-      messagesEl.innerHTML = "";
       addMessage("system", `${modelEl.value} に切り替えます。初回応答時にモデルをロードします。`);
       sendEl.disabled = true;
       setStatus("switching", "busy");
@@ -578,6 +770,34 @@ HTML = """<!doctype html>
       }, 3000);
     });
 
+    loginFormEl.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const displayName = loginNameEl.value.trim();
+      if (!displayName) return;
+      loginErrorEl.textContent = "";
+      try {
+        await login(displayName);
+      } catch (error) {
+        loginErrorEl.textContent = error.message;
+      }
+    });
+
+    clearHistoryEl.addEventListener("click", async () => {
+      if (isRunning) return;
+      await fetch(`/api/history/${encodeURIComponent(currentUserId)}`, { method: "DELETE" });
+      renderConversation([]);
+    });
+
+    logoutEl.addEventListener("click", async () => {
+      if (isRunning) return;
+      sessionStorage.removeItem("gaudiChatUserId");
+      sessionStorage.removeItem("gaudiChatDisplayName");
+      currentUserId = "";
+      currentDisplayName = "";
+      renderConversation([]);
+      showLogin();
+    });
+
     promptEl.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
@@ -585,6 +805,11 @@ HTML = """<!doctype html>
       }
     });
 
+    if (currentUserId) {
+      loadHistory(currentUserId).then(showChat).catch(showLogin);
+    } else {
+      showLogin();
+    }
     refreshHealth();
     setInterval(refreshHealth, 10000);
   </script>
@@ -600,6 +825,7 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     request_id: str | None = None
+    user_id: str = "default"
     model_id: str = DEFAULT_MODEL_ID
     messages: list[ChatMessage] = Field(min_length=1)
     reasoning_effort: Literal["low", "medium", "high"] = "medium"
@@ -612,6 +838,24 @@ class ChatRequest(BaseModel):
 
 class SwitchModelRequest(BaseModel):
     model_id: str
+
+
+class UserRequest(BaseModel):
+    user_id: str | None = None
+    display_name: str = Field(min_length=1, max_length=80)
+
+
+class UserSummary(BaseModel):
+    user_id: str
+    display_name: str
+    message_count: int
+    updated_at: str | None = None
+
+
+class HistoryResponse(BaseModel):
+    user_id: str
+    display_name: str
+    messages: list[ChatMessage]
 
 
 class SearchResult(BaseModel):
@@ -647,6 +891,123 @@ class ChatResponse(BaseModel):
 
 class RequestCancelled(Exception):
     pass
+
+
+class HistoryStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.lock = threading.Lock()
+
+    def _now(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _user_id(self, value: str | None, display_name: str | None = None) -> str:
+        raw = (value or display_name or "default").strip().lower()
+        user_id = re.sub(r"[^a-z0-9_.-]+", "-", raw).strip("-._")
+        return user_id[:64] or "default"
+
+    def _load_unlocked(self) -> dict:
+        if not self.path.exists():
+            return {"users": {}}
+        try:
+            with self.path.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (json.JSONDecodeError, OSError):
+            return {"users": {}}
+        if not isinstance(data, dict):
+            return {"users": {}}
+        users = data.get("users")
+        if not isinstance(users, dict):
+            data["users"] = {}
+        return data
+
+    def _save_unlocked(self, data: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_suffix(f"{self.path.suffix}.tmp")
+        with tmp_path.open("w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+        tmp_path.replace(self.path)
+
+    def ensure_user(self, user_id: str | None = None, display_name: str | None = None) -> dict:
+        normalized_user_id = self._user_id(user_id, display_name)
+        label = (display_name or normalized_user_id).strip() or normalized_user_id
+        with self.lock:
+            data = self._load_unlocked()
+            users = data["users"]
+            record = users.get(normalized_user_id)
+            if record is None:
+                record = {
+                    "display_name": label,
+                    "messages": [],
+                    "created_at": self._now(),
+                    "updated_at": self._now(),
+                }
+                users[normalized_user_id] = record
+            elif display_name:
+                record["display_name"] = label
+                record["updated_at"] = self._now()
+            self._save_unlocked(data)
+            return {"user_id": normalized_user_id, **record}
+
+    def list_users(self) -> list[UserSummary]:
+        self.ensure_user("default")
+        with self.lock:
+            data = self._load_unlocked()
+            summaries = []
+            for user_id, record in data["users"].items():
+                messages = record.get("messages") if isinstance(record, dict) else []
+                summaries.append(
+                    UserSummary(
+                        user_id=user_id,
+                        display_name=record.get("display_name", user_id),
+                        message_count=len(messages or []),
+                        updated_at=record.get("updated_at"),
+                    )
+                )
+        return sorted(summaries, key=lambda user: user.updated_at or "", reverse=True)
+
+    def history(self, user_id: str) -> HistoryResponse:
+        record = self.ensure_user(user_id)
+        messages = []
+        for message in record.get("messages", []):
+            try:
+                messages.append(ChatMessage(**message))
+            except Exception:
+                continue
+        return HistoryResponse(
+            user_id=record["user_id"],
+            display_name=record.get("display_name", record["user_id"]),
+            messages=messages,
+        )
+
+    def replace_history(self, user_id: str, messages: list[ChatMessage]) -> None:
+        normalized_user_id = self._user_id(user_id)
+        with self.lock:
+            data = self._load_unlocked()
+            users = data["users"]
+            record = users.get(normalized_user_id)
+            if record is None:
+                record = {
+                    "display_name": normalized_user_id,
+                    "messages": [],
+                    "created_at": self._now(),
+                }
+                users[normalized_user_id] = record
+            record["messages"] = [message.model_dump() for message in messages]
+            record["updated_at"] = self._now()
+            self._save_unlocked(data)
+
+    def clear_history(self, user_id: str) -> None:
+        normalized_user_id = self._user_id(user_id)
+        with self.lock:
+            data = self._load_unlocked()
+            record = data["users"].get(normalized_user_id)
+            if record is None:
+                return
+            record["messages"] = []
+            record["updated_at"] = self._now()
+            self._save_unlocked(data)
 
 
 class CancelStoppingCriteria(StoppingCriteria):
@@ -828,6 +1189,7 @@ class ChatEngine:
             raise RuntimeError("HPU is not available. Check Habana driver/runtime setup.")
 
         self.unload()
+        htcore.hpu_inference_set_env()
         spec = MODEL_SPECS[model_id]
         started = time.time()
         if spec["kind"] == "image_text":
@@ -915,6 +1277,10 @@ class ChatEngine:
 
             text = self.render_prompt(request)
             inputs = self.tokenize(text)
+            if USE_INT32_INPUTS:
+                for key in ("input_ids", "attention_mask"):
+                    if key in inputs:
+                        inputs[key] = inputs[key].to(dtype=torch.int32)
             inputs = {key: value.to("hpu") for key, value in inputs.items()}
 
             started = time.time()
@@ -937,6 +1303,7 @@ class ChatEngine:
                             temperature=request.temperature if do_sample else None,
                             top_p=request.top_p if do_sample else None,
                             pad_token_id=self.eos_token_id(),
+                            use_cache=True,
                             stopping_criteria=StoppingCriteriaList([CancelStoppingCriteria(cancel_event)]),
                             streamer=streamer,
                         )
@@ -1025,6 +1392,7 @@ def package_version(name: str) -> str:
 
 def create_app(model_id: str) -> FastAPI:
     engine = ChatEngine(model_id)
+    history_store = HistoryStore(HISTORY_PATH)
     progress_lock = threading.Lock()
     agent_progress: dict[str, dict] = {}
     cancel_events: dict[str, threading.Event] = {}
@@ -1096,12 +1464,16 @@ def create_app(model_id: str) -> FastAPI:
             "agent_modes": AGENT_MODES,
             "search_engine": SEARCH_ENGINE.lower(),
             "search_timeout_sec": SEARCH_TIMEOUT_SEC,
+            "hpu_execution_mode": HPU_EXECUTION_MODE,
+            "use_int32_inputs": USE_INT32_INPUTS,
+            "model_placement": MODEL_PLACEMENT,
             "active_model_id": engine.active_model_id,
             "model_loaded": engine.is_loaded,
             "precision": engine.precision,
             "fp8_enabled": engine.precision.startswith("fp8"),
             "hpu_available": torch.hpu.is_available(),
             "hpu_devices": torch.hpu.device_count() if torch.hpu.is_available() else 0,
+            "hpu_current_device": torch.hpu.current_device() if torch.hpu.is_available() else None,
             "loaded_at": engine.loaded_at,
         }
 
@@ -1112,6 +1484,23 @@ def create_app(model_id: str) -> FastAPI:
         if record is None:
             return {"steps": [], "done": False}
         return {"steps": record["steps"], "done": record["done"], "updated_at": record["updated_at"]}
+
+    @app.post("/api/users")
+    def save_user(request: UserRequest) -> dict:
+        record = history_store.ensure_user(request.user_id, request.display_name)
+        return {
+            "user_id": record["user_id"],
+            "display_name": record.get("display_name", record["user_id"]),
+        }
+
+    @app.get("/api/history/{user_id}", response_model=HistoryResponse)
+    def user_history(user_id: str) -> HistoryResponse:
+        return history_store.history(user_id)
+
+    @app.delete("/api/history/{user_id}")
+    def clear_user_history(user_id: str) -> dict:
+        history_store.clear_history(user_id)
+        return {"cleared": True, "user_id": user_id}
 
     @app.post("/api/cancel/{request_id}")
     def cancel_request(request_id: str) -> dict:
@@ -1176,7 +1565,11 @@ def create_app(model_id: str) -> FastAPI:
             update_step(request_id, steps, cursor, "done", "生成用プロンプトを作成")
             cursor += 1
             update_step(request_id, steps, cursor, "active", "HPU 上のモデルで生成しています")
-            return engine.generate(enriched_request, sources=sources, cancel_event=cancel_event)
+            response = engine.generate(enriched_request, sources=sources, cancel_event=cancel_event)
+            saved_messages = list(request.messages)
+            saved_messages.append(ChatMessage(role="assistant", content=response.reply))
+            history_store.replace_history(request.user_id, saved_messages)
+            return response
         except HTTPException:
             update_step(request_id, steps, len(steps) - 1, "error", "リクエストを完了できませんでした", done=True)
             raise
@@ -1252,6 +1645,5 @@ if __name__ == "__main__":
     args = parse_args()
     SERVER_HOST = args.host
     SERVER_PORT = args.port
-    os.environ.setdefault("PT_HPU_LAZY_MODE", "0")
     app = create_app(args.model_id)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
