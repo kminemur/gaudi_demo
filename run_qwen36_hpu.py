@@ -24,6 +24,7 @@ from transformers import (
 MODEL_ID = "Qwen/Qwen3.6-27B-FP8"
 FP8_CORRECTNESS_FALLBACKS = {
     "Qwen/Qwen3.6-27B-FP8": "Qwen/Qwen3.6-27B",
+    "Qwen/Qwen3-32B-FP8": "Qwen/Qwen3-32B",
 }
 QWEN3_TEXT_TP_PLAN = {
     "layers.*.self_attn.q_proj": "colwise",

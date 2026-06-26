@@ -163,3 +163,7 @@ HF_HOME=$PWD/hf_cache PT_HPU_WEIGHT_SHARING=0 \
 This venv supports Qwen3 models such as `Qwen/Qwen3-32B`. It does not support
 Qwen3.6 checkpoints such as `Qwen/Qwen3.6-27B`, because those require the newer
 `qwen3_5` architecture in Transformers 5.x.
+
+`Qwen/Qwen3-32B-FP8` is accepted by the CLI, but the current HPU + Optimum Habana
+FP8 path creates an FP8 KV cache while the model produces bf16 key/value states.
+The demo therefore falls back to `Qwen/Qwen3-32B` for correct generation.
