@@ -49,6 +49,11 @@ HPU_EXECUTION_MODE = "lazy" if os.environ.get("PT_HPU_LAZY_MODE") == "1" else "e
 USE_INT32_INPUTS = os.environ.get("USE_INT32_INPUTS", "1") == "1"
 MODEL_PLACEMENT = "single_hpu_transformers"
 MODEL_SPECS = {
+    "Qwen/Qwen3.6-27B-FP8": {
+        "label": "Qwen3.6 27B FP8",
+        "kind": "image_text",
+        "precision": "fp8 pretrained",
+    },
     "Qwen/Qwen3.6-35B-A3B-FP8": {
         "label": "Qwen3.6 35B A3B FP8",
         "kind": "image_text",
@@ -65,6 +70,27 @@ MODEL_SPECS = {
         "precision": "bf16",
     },
 }
+FP8_CORRECTNESS_FALLBACKS = {
+    "Qwen/Qwen3.6-27B-FP8": "Qwen/Qwen3.6-27B",
+}
+
+
+def is_fp8_model(model_id: str) -> bool:
+    return model_id.upper().endswith("-FP8")
+
+
+def resolve_execution_model_id(model_id: str) -> str:
+    if torch.hpu.is_available() and model_id in FP8_CORRECTNESS_FALLBACKS:
+        fallback_model_id = FP8_CORRECTNESS_FALLBACKS[model_id]
+        print(
+            f"{model_id} produces non-finite logits on the current HPU Transformers FP8 path; "
+            f"using {fallback_model_id} for correctness.",
+            flush=True,
+        )
+        return fallback_model_id
+    return model_id
+
+
 REASONING_PRESETS = {
     "low": {
         "label": "Low",
@@ -452,6 +478,7 @@ HTML = """<!doctype html>
       <form id="chatForm">
         <select id="model" aria-label="model">
           <option value="Qwen/Qwen3.6-27B" selected>Qwen3.6 27B</option>
+          <option value="Qwen/Qwen3.6-27B-FP8">Qwen3.6 27B FP8</option>
           <option value="Qwen/Qwen3.6-35B-A3B-FP8">Qwen3.6 35B A3B FP8</option>
           <option value="Qwen/Qwen3-32B">Qwen3 32B</option>
         </select>
@@ -1191,17 +1218,19 @@ class ChatEngine:
         self.unload()
         htcore.hpu_inference_set_env()
         spec = MODEL_SPECS[model_id]
+        execution_model_id = resolve_execution_model_id(model_id)
         started = time.time()
         if spec["kind"] == "image_text":
-            tokenizer = AutoProcessor.from_pretrained(model_id)
+            tokenizer = AutoProcessor.from_pretrained(execution_model_id)
             model_cls = AutoModelForImageTextToText
         else:
-            tokenizer = AutoTokenizer.from_pretrained(model_id)
+            tokenizer = AutoTokenizer.from_pretrained(execution_model_id)
             model_cls = AutoModelForCausalLM
 
+        model_kwargs = {} if is_fp8_model(execution_model_id) else {"dtype": torch.bfloat16}
         self.model = model_cls.from_pretrained(
-            model_id,
-            dtype=torch.bfloat16,
+            execution_model_id,
+            **model_kwargs,
             low_cpu_mem_usage=True,
             device_map={"": "hpu"},
         )
@@ -1211,7 +1240,9 @@ class ChatEngine:
         self.model_kind = spec["kind"]
         htcore.mark_step()
         torch.hpu.synchronize()
-        self.precision = spec["precision"]
+        self.precision = (
+            f"bf16 fallback from {model_id}" if execution_model_id != model_id else spec["precision"]
+        )
         self.loaded_at = time.time()
         print(f"Loaded {model_id} on HPU in {self.loaded_at - started:.1f}s ({self.precision})", flush=True)
 

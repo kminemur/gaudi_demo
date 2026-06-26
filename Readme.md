@@ -15,12 +15,37 @@ HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python chat_server.py \
 
 Then open `http://<server-ip>:8000/`.
 
+To keep the server running in the background after closing the terminal, start it
+with `nohup`:
+
+```bash
+cd /home/test1/kazuki/gaudi_demo
+
+HF_HOME=$PWD/hf_cache nohup /home/test1/habanalabs-venv/bin/python chat_server.py \
+  --host 0.0.0.0 \
+  --port 8000 \
+  > chat_server.log 2>&1 &
+```
+
+Check the startup log:
+
+```bash
+tail -f chat_server.log
+```
+
+Stop the background server:
+
+```bash
+pkill -f "chat_server.py --host 0.0.0.0 --port 8000"
+```
+
 The first screen asks for a user name. Each user gets a separate chat screen and
 history, saved in `chat_history.json`.
 
 The UI can switch between:
 
 - `Qwen/Qwen3.6-27B`
+- `Qwen/Qwen3.6-27B-FP8`
 - `Qwen/Qwen3.6-35B-A3B-FP8`
 - `Qwen/Qwen3-32B`
 
@@ -76,6 +101,15 @@ HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python run_qwen36_hpu.py \
   --prompt "日本語で短く自己紹介して"
 ```
 
+The CLI defaults to `Qwen/Qwen3.6-27B-FP8`. To run the bf16 checkpoint instead,
+pass `--model-id Qwen/Qwen3.6-27B`.
+
+On the current Gaudi HPU + Transformers path, `Qwen/Qwen3.6-27B-FP8` produces
+non-finite logits after the built-in FP8-to-bf16 fallback. The demo therefore
+accepts the FP8 model ID but automatically executes the sibling bf16 checkpoint
+`Qwen/Qwen3.6-27B` for correct text output. Pass
+`--disable-fp8-correctness-fallback` only when debugging the raw FP8 path.
+
 This machine has Habana software 1.24 installed. The working Python environment is
 `/home/test1/habanalabs-venv`.
 
@@ -84,3 +118,48 @@ support. `optimum-habana==1.21.0` is installed in the environment, but its publi
 wrappers are currently pinned to `transformers<4.56`, so this demo uses the
 Habana PyTorch bridge directly while keeping the Gaudi/Optimum Habana environment
 installed.
+
+## Optimum Habana compatibility venv
+
+An alternate environment for Optimum Habana compatibility is available at:
+
+```bash
+/home/test1/habanalabs-venv-optimum
+```
+
+It keeps the Habana runtime stack and uses:
+
+```text
+optimum-habana==1.21.0
+transformers==4.55.4
+huggingface_hub==0.36.2
+tokenizers==0.21.4
+```
+
+Because Optimum Habana checks the Habana package version by running `pip`, put
+the venv `bin` directory first in `PATH`:
+
+```bash
+PATH=/home/test1/habanalabs-venv-optimum/bin:$PATH \
+HF_HOME=$PWD/hf_cache \
+/home/test1/habanalabs-venv-optimum/bin/python run_qwen36_hpu.py \
+  --model-id Qwen/Qwen3-32B \
+  --prompt "日本語で短く自己紹介して"
+```
+
+For tensor parallel:
+
+```bash
+PATH=/home/test1/habanalabs-venv-optimum/bin:$PATH \
+HF_HOME=$PWD/hf_cache PT_HPU_WEIGHT_SHARING=0 \
+/home/test1/habanalabs-venv-optimum/bin/python -m torch.distributed.run \
+  --standalone --nproc_per_node=2 \
+  run_qwen36_hpu.py \
+  --model-id Qwen/Qwen3-32B \
+  --tensor-parallel-size 2 \
+  --prompt "日本語で短く自己紹介して"
+```
+
+This venv supports Qwen3 models such as `Qwen/Qwen3-32B`. It does not support
+Qwen3.6 checkpoints such as `Qwen/Qwen3.6-27B`, because those require the newer
+`qwen3_5` architecture in Transformers 5.x.
