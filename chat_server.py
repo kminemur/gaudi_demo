@@ -1070,45 +1070,24 @@ HTML = """<!doctype html>
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
-      if (isRunning) {
-        await cancelActiveRequest();
-        return;
-      }
       const prompt = promptEl.value.trim();
       if (!prompt) return;
 
       promptEl.value = "";
-      isRunning = true;
-      sendEl.textContent = "キャンセル";
-      sendEl.classList.add("cancel");
-      setStatus("generating", "busy");
+      setStatus("queued", "busy");
       const modeLabel = agentModeEl.options[agentModeEl.selectedIndex].textContent;
-      startActivity(modeLabel, "リクエストを送信しています");
+      startActivity(modeLabel, "ジョブをキューに追加しています");
       addMessage("user", prompt);
       chatHistory.push({ role: "user", content: prompt });
       const requestId = makeRequestId();
-      activeRequestId = requestId;
-      activeController = new AbortController();
-      const assistantNode = addMessage("assistant", agentModeEl.value === "chat" ? "生成中..." : `${modeLabel} で回答作成中...`);
+      const assistantNode = addMessage("assistant", "キューに追加しています...");
       const stepsNode = addStepPanel();
       renderSteps(stepsNode, clientInitialSteps(agentModeEl.value));
-      const stepPoll = setInterval(async () => {
-        try {
-          const res = await fetch(`/api/agent_steps/${encodeURIComponent(requestId)}`);
-          if (!res.ok) return;
-          const data = await res.json();
-          renderSteps(stepsNode, data.steps);
-          const summary = activeStepSummary(data.steps);
-          if (summary) updateActivity(modeLabel, summary, data.done ? "ready" : "busy");
-          if (data.done) clearInterval(stepPoll);
-        } catch (_error) {}
-      }, 750);
 
       try {
-        const res = await fetch("/api/chat/stream", {
+        const res = await fetch("/api/chat/jobs", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          signal: activeController.signal,
           body: JSON.stringify({
             request_id: requestId,
             user_id: currentUserId,
@@ -1121,86 +1100,60 @@ HTML = """<!doctype html>
         });
         if (!res.ok) {
           const data = await res.json();
-          throw new Error(data.detail || "request failed");
+          throw new Error(data.detail || "ジョブを開始できませんでした");
         }
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-        let streamedText = "";
-        let finalData = null;
-        let hasDelta = false;
+        assistantNode.textContent = "順番待ちです。続けて送信できます。";
+        sendEl.disabled = false;
+        sendEl.textContent = "送信";
+        setStatus("queued", "busy");
+        finishActivity("ジョブを受け付けました");
 
-        const handleStreamEvent = (event) => {
-          if (event.type === "delta") {
-            if (!hasDelta) {
-              assistantNode.textContent = "";
-              hasDelta = true;
+        const poll = setInterval(async () => {
+          try {
+            const [stepsRes, jobRes] = await Promise.all([
+              fetch(`/api/agent_steps/${encodeURIComponent(requestId)}`),
+              fetch(`/api/chat/jobs/${encodeURIComponent(requestId)}`)
+            ]);
+            if (stepsRes.ok) {
+              const stepData = await stepsRes.json();
+              renderSteps(stepsNode, stepData.steps);
+              const summary = activeStepSummary(stepData.steps);
+              if (summary && !stepData.done) {
+                assistantNode.textContent = summary;
+              }
             }
-            streamedText += event.text || "";
-            assistantNode.textContent = streamedText;
-            messagesEl.scrollTop = messagesEl.scrollHeight;
-          } else if (event.type === "final") {
-            finalData = event.data;
-          } else if (event.type === "error") {
-            throw new Error(event.detail || "stream failed");
-          } else if (event.type === "status") {
-            if (event.message && !hasDelta) assistantNode.textContent = event.message;
-            if (event.steps) renderSteps(stepsNode, event.steps);
-            if (event.message) updateActivity(modeLabel, event.message, "busy");
-            if (event.steps) {
-              const summary = activeStepSummary(event.steps);
-              if (summary) updateActivity(modeLabel, summary, "busy");
+            if (!jobRes.ok) return;
+            const job = await jobRes.json();
+            if (!job.done) return;
+            clearInterval(poll);
+            if (job.error) {
+              assistantNode.textContent = `エラー: ${job.error}`;
+              setStatus("error", "");
+              return;
             }
-            if (event.status) setStatus(event.status, "busy");
+            const finalData = job.response;
+            assistantNode.textContent = finalData.reply || "";
+            addMetrics(finalData);
+            addSources(finalData.sources);
+            chatHistory.push({ role: "assistant", content: finalData.reply || "" });
+            await loadThreads();
+            setStatus("ready", "ready");
+          } catch (error) {
+            clearInterval(poll);
+            assistantNode.textContent = `エラー: ${error.message}`;
+            setStatus("error", "");
           }
-        };
+        }, 1000);
 
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-          for (const line of lines) {
-            if (line.trim()) handleStreamEvent(JSON.parse(line));
-          }
-        }
-        buffer += decoder.decode();
-        if (buffer.trim()) handleStreamEvent(JSON.parse(buffer));
-        if (!finalData) throw new Error("stream ended before final response");
-
-        assistantNode.textContent = finalData.reply || streamedText || "";
-        addMetrics(finalData);
-        addSources(finalData.sources);
-        chatHistory.push({ role: "assistant", content: finalData.reply || streamedText || "" });
-        await loadThreads();
         setStatus("ready", "ready");
-        finishActivity(`${modeLabel} 完了`);
       } catch (error) {
-        if (error.name === "AbortError") {
-          assistantNode.textContent = "キャンセルしました。";
-          setStatus("cancelled", "");
-          finishActivity("キャンセルしました");
-        } else {
-          assistantNode.textContent = `エラー: ${error.message}`;
-          setStatus("error", "");
-          finishActivity(`エラー: ${error.message}`);
-        }
+        assistantNode.textContent = `エラー: ${error.message}`;
+        setStatus("error", "");
+        finishActivity(`エラー: ${error.message}`);
       } finally {
-        clearInterval(stepPoll);
-        try {
-          const res = await fetch(`/api/agent_steps/${encodeURIComponent(requestId)}`);
-          if (res.ok) {
-            const data = await res.json();
-            renderSteps(stepsNode, data.steps);
-          }
-        } catch (_error) {}
         sendEl.disabled = false;
         sendEl.textContent = "送信";
         sendEl.classList.remove("cancel");
-        isRunning = false;
-        activeRequestId = null;
-        activeController = null;
         promptEl.focus();
       }
     });
@@ -1560,6 +1513,14 @@ class ChatResponse(BaseModel):
     ttft_sec: float
     tokens_per_sec: float
     generated_tokens: int
+
+
+class AsyncJobResponse(BaseModel):
+    request_id: str
+    done: bool = False
+    response: ChatResponse | None = None
+    error: str | None = None
+    updated_at: float
 
 
 class RequestCancelled(Exception):
@@ -2488,6 +2449,7 @@ def create_app(model_id: str) -> FastAPI:
     agent_progress: dict[str, dict] = {}
     cancel_events: dict[str, threading.Event] = {}
     progress_threads: dict[str, dict[str, str]] = {}
+    async_jobs: dict[str, dict] = {}
     fallback_lock = threading.Lock()
     fallback_jobs: dict[str, dict] = {}
 
@@ -2505,6 +2467,14 @@ def create_app(model_id: str) -> FastAPI:
     def set_progress_thread(request_id: str, user_id: str, thread_id: str) -> None:
         with progress_lock:
             progress_threads[request_id] = {"user_id": user_id, "thread_id": thread_id}
+
+    def set_async_job(request_id: str, **updates) -> None:
+        with progress_lock:
+            job = async_jobs.get(request_id)
+            if not job:
+                return
+            job.update(updates)
+            job["updated_at"] = time.time()
 
     def cancel_event_for(request_id: str) -> threading.Event:
         with progress_lock:
@@ -2919,6 +2889,137 @@ def create_app(model_id: str) -> FastAPI:
                 steps[-1].detail = "ユーザーがリクエストをキャンセルしました"
             set_steps(request_id, steps, done=True)
         return {"cancelled": True, "request_id": request_id}
+
+    def execute_chat_job(request_id: str, request: ChatRequest) -> None:
+        cancel_event = cancel_event_for(request_id)
+        steps = initial_steps(request.agent_mode)
+        set_steps(request_id, steps)
+        set_async_job(request_id, done=False, error=None)
+        resolved_mode = "chat"
+        search_decision = ""
+        sources: list[SearchResult] = []
+        try:
+            if engine.is_loaded and engine.active_model_id != request.model_id:
+                raise RuntimeError("Select the model in the UI first. The server restarts to switch models cleanly.")
+            cursor = 1
+            resolved_mode, search_decision = resolve_agent_mode(request)
+            if request.agent_mode == "auto":
+                update_step(request_id, steps, cursor, "active", "検索が必要か判定しています")
+                update_step(request_id, steps, cursor, "done", search_decision)
+                cursor += 1
+            if resolved_mode in {"web", "deep"}:
+                search_index = insert_search_steps(steps, resolved_mode)
+                if search_index:
+                    cursor = search_index
+                    set_steps(request_id, steps)
+                update_step(request_id, steps, cursor, "active", "検索クエリを実行しています")
+                search_bundle = collect_sources(
+                    request.messages[-1].content,
+                    resolved_mode,
+                    cancel_event=cancel_event,
+                )
+                sources = search_bundle.sources
+                detail = f"{len(sources)} 件の候補を取得"
+                if search_bundle.warnings:
+                    detail = f"{len(sources)} 件取得。一部検索失敗: {len(search_bundle.warnings)} 件"
+                update_step(request_id, steps, cursor, "done", detail)
+                cursor += 1
+                update_step(request_id, steps, cursor, "active", "モデルへ渡す根拠を整えています")
+                if sources:
+                    update_step(request_id, steps, cursor, "done", f"{min(len(sources), 8)} 件をコンテキスト化")
+                else:
+                    update_step(request_id, steps, cursor, "done", "検索結果なし。通常プロンプトで続行")
+                cursor += 1
+
+            update_step(request_id, steps, cursor, "active", "会話履歴とエージェント結果を結合しています")
+            enriched_request = request_with_sources(request, sources)
+            if resolved_mode == "deep" and enriched_request.max_new_tokens is None:
+                enriched_request = enriched_request.model_copy(update={"max_new_tokens": 4096})
+            update_step(request_id, steps, cursor, "done", "生成用プロンプトを作成")
+            cursor += 1
+            update_step(request_id, steps, cursor, "active", "HPU 上のモデルで生成しています")
+            response = engine.generate(enriched_request, sources=sources, cancel_event=cancel_event)
+            response = response.model_copy(
+                update={
+                    "agent_mode": request.agent_mode,
+                    "resolved_mode": resolved_mode,
+                    "search_decision": search_decision,
+                }
+            )
+            history = history_store.thread_history(request.user_id, request.thread_id)
+            saved_messages = list(history.messages)
+            saved_messages.append(ChatMessage(role="assistant", content=response.reply))
+            history_store.replace_history(
+                request.user_id,
+                saved_messages,
+                request.thread_id,
+                last_mode=request.agent_mode,
+                last_model_id=request.model_id,
+            )
+            steps[-2].status = "done"
+            steps[-2].detail = "生成が完了しました"
+            steps[-1].status = "done"
+            steps[-1].detail = "ブラウザへ応答を返しました"
+            set_steps(request_id, steps, done=True)
+            set_async_job(request_id, done=True, response=response.model_dump(), error=None)
+            print(
+                f"Async chat job complete: request_id={request_id}, user={request.user_id}, "
+                f"thread={request.thread_id}, resolved={resolved_mode}",
+                flush=True,
+            )
+        except RequestCancelled:
+            for step in steps:
+                if step.status == "active":
+                    step.status = "error"
+                    step.detail = "キャンセルされました"
+            steps[-1].status = "error"
+            steps[-1].detail = "ユーザーがリクエストをキャンセルしました"
+            set_steps(request_id, steps, done=True)
+            set_async_job(request_id, done=True, error="Request cancelled")
+        except Exception as exc:
+            update_step(request_id, steps, len(steps) - 1, "error", str(exc), done=True)
+            set_async_job(request_id, done=True, error=str(exc))
+            print(f"Async chat job error: request_id={request_id}, error={exc}", flush=True)
+
+    @app.post("/api/chat/jobs")
+    def enqueue_chat_job(request: ChatRequest) -> dict:
+        request_id = request_key(request.request_id)
+        cancel_event = cancel_event_for(request_id)
+        cancel_event.clear()
+        set_progress_thread(request_id, request.user_id, request.thread_id)
+        history_store.replace_history(
+            request.user_id,
+            request.messages,
+            request.thread_id,
+            last_mode=request.agent_mode,
+            last_model_id=request.model_id,
+        )
+        with progress_lock:
+            async_jobs[request_id] = {
+                "request_id": request_id,
+                "done": False,
+                "response": None,
+                "error": None,
+                "updated_at": time.time(),
+            }
+        worker = threading.Thread(target=execute_chat_job, args=(request_id, request), daemon=True)
+        worker.start()
+        return {"request_id": request_id, "queued": True}
+
+    @app.get("/api/chat/jobs/{request_id}", response_model=AsyncJobResponse)
+    def chat_job_status(request_id: str) -> AsyncJobResponse:
+        with progress_lock:
+            job = async_jobs.get(request_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        response = ChatResponse(**job["response"]) if job.get("response") else None
+        return AsyncJobResponse(
+            request_id=request_id,
+            done=bool(job.get("done")),
+            response=response,
+            error=job.get("error"),
+            updated_at=float(job.get("updated_at", time.time())),
+        )
 
     @app.post("/api/chat", response_model=ChatResponse)
     def chat(request: ChatRequest) -> ChatResponse:

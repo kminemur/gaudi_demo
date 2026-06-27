@@ -75,8 +75,9 @@ per-message search decision inside the active thread.
 
 While a message is running, the UI shows agent steps such as web search,
 source preparation, prompt construction, model generation, and completion.
-Use the cancel button to stop the active request; the server marks the request as
-cancelled and asks generation to stop at the next token boundary.
+Messages are submitted as asynchronous jobs, so you can continue sending follow-up
+prompts while previous generations are queued or running. HPU generation is still
+serialized by the server-side model lock on a single HPU.
 
 When you choose a different model, the server unloads the current model and loads
 the selected one on the next chat request.
