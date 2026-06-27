@@ -20,8 +20,8 @@ from urllib.parse import quote_plus, unquote, urlparse, parse_qs
 
 # These must be set before importing torch / habana_frameworks. Lazy mode can be
 # faster for some LLMs, but this model path currently starts more reliably in
-# eager mode. Weight sharing is also disabled by default to avoid quantized-model
-# memory warnings when FP8 checkpoints are not in use.
+# eager mode. Weight sharing is also disabled by default to avoid extra HPU
+# memory consumption.
 os.environ.setdefault("PT_HPU_LAZY_MODE", "0")
 os.environ.setdefault("PT_HPU_WEIGHT_SHARING", "0")
 
@@ -43,7 +43,6 @@ from transformers import (
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 
-PREFERRED_DEFAULT_MODEL_ID = "Qwen/Qwen3.6-27B"
 COMPAT_DEFAULT_MODEL_ID = "Qwen/Qwen3-32B"
 
 
@@ -51,11 +50,7 @@ def transformer_supports_model_type(model_type: str) -> bool:
     return model_type in CONFIG_MAPPING
 
 
-DEFAULT_MODEL_ID = (
-    PREFERRED_DEFAULT_MODEL_ID
-    if transformer_supports_model_type("qwen3_5")
-    else COMPAT_DEFAULT_MODEL_ID
-)
+DEFAULT_MODEL_ID = COMPAT_DEFAULT_MODEL_ID
 DEFAULT_SERVER_PORT = 8000
 SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", DEFAULT_SERVER_PORT))
@@ -68,21 +63,6 @@ USE_INT32_INPUTS = os.environ.get("USE_INT32_INPUTS", "1") == "1"
 MODEL_PLACEMENT = "single_hpu_transformers"
 OPTIMUM_HABANA_ENABLED: bool | None = None
 MODEL_SPECS = {
-    "Qwen/Qwen3.6-27B-FP8": {
-        "label": "Qwen3.6 27B FP8",
-        "kind": "image_text",
-        "precision": "fp8 pretrained",
-    },
-    "Qwen/Qwen3.6-35B-A3B-FP8": {
-        "label": "Qwen3.6 35B A3B FP8",
-        "kind": "image_text",
-        "precision": "fp8 pretrained",
-    },
-    "Qwen/Qwen3.6-27B": {
-        "label": "Qwen3.6 27B",
-        "kind": "image_text",
-        "precision": "bf16",
-    },
     "Qwen/Qwen3-32B": {
         "label": "Qwen3 32B",
         "kind": "causal_lm",
@@ -94,14 +74,8 @@ MODEL_SPECS = {
         "precision": "bf16",
     },
 }
-MODEL_REQUIRED_TYPES = {
-    "Qwen/Qwen3.6-27B-FP8": "qwen3_5",
-    "Qwen/Qwen3.6-35B-A3B-FP8": "qwen3_5",
-    "Qwen/Qwen3.6-27B": "qwen3_5",
-}
-FP8_CORRECTNESS_FALLBACKS = {
-    "Qwen/Qwen3.6-27B-FP8": "Qwen/Qwen3.6-27B",
-}
+MODEL_REQUIRED_TYPES = {}
+FP8_CORRECTNESS_FALLBACKS = {}
 
 
 def is_model_supported(model_id: str) -> bool:
@@ -711,10 +685,7 @@ HTML = """<!doctype html>
             <div class="option-title">オプション</div>
             <div class="option-controls">
               <select id="model" name="model_id" aria-label="model">
-                <option value="Qwen/Qwen3.6-27B" selected>Qwen3.6 27B</option>
-                <option value="Qwen/Qwen3.6-27B-FP8">Qwen3.6 27B FP8</option>
-                <option value="Qwen/Qwen3.6-35B-A3B-FP8">Qwen3.6 35B A3B FP8</option>
-                <option value="Qwen/Qwen3-32B">Qwen3 32B</option>
+                <option value="Qwen/Qwen3-32B" selected>Qwen3 32B</option>
                 <option value="Qwen/Qwen3-235B-A22B">Qwen3 235B A22B</option>
               </select>
               <select id="reasoning" name="reasoning_effort" aria-label="reasoning strength">

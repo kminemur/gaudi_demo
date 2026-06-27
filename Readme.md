@@ -1,11 +1,36 @@
 # Gaudi demo
 
 Run Qwen models on Intel Gaudi HPU. The chat server defaults to
-`Qwen/Qwen3.6-27B`.
+`Qwen/Qwen3-32B`.
 
 ## Docs
 
 - [AI Agent Specification with Intel Gaudi](docs/ai_agent_gaudi_spec.md)
+
+## Model download script
+
+Use the dedicated script to pre-download model snapshots into Hugging Face cache.
+
+Download all demo default models:
+
+```bash
+HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python download_hf_models.py --all-defaults
+```
+
+Download specific models only:
+
+```bash
+HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python download_hf_models.py \
+  --model-id Qwen/Qwen3-32B \
+  --model-id Qwen/Qwen3-235B-A22B
+```
+
+If authentication is required, set a token:
+
+```bash
+HF_TOKEN=<your_token> HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python download_hf_models.py \
+  --model-id Qwen/Qwen3-235B-A22B
+```
 
 ## Chat UI
 
@@ -49,9 +74,6 @@ history, saved in `chat_history.json`.
 
 The UI can switch between:
 
-- `Qwen/Qwen3.6-27B`
-- `Qwen/Qwen3.6-27B-FP8`
-- `Qwen/Qwen3.6-35B-A3B-FP8`
 - `Qwen/Qwen3-32B`
 - `Qwen/Qwen3-235B-A22B`
 
@@ -84,8 +106,8 @@ serialized by the server-side model lock on a single HPU.
 When you choose a different model, the server unloads the current model and loads
 the selected one on the next chat request.
 
-`Qwen/Qwen3.6-35B-A3B-FP8` uses the pretrained FP8 weights from Hugging Face.
-It remains available in the model selector alongside the default 27B bf16 model.
+The chat server exposes only `Qwen/Qwen3-32B` and `Qwen/Qwen3-235B-A22B` in the
+model selector.
 
 ## Performance notes
 
@@ -93,16 +115,14 @@ The built-in FastAPI server uses Transformers directly on a single HPU. On an
 8-card Gaudi2 host this leaves the other HPUs idle; use vLLM for Intel Gaudi or
 DeepSpeed/Optimum Habana tensor parallel inference for production throughput.
 
-`Qwen/Qwen3.6-35B-A3B-FP8` currently emits a Transformers warning that the FP8
-checkpoint is dequantized to bf16 on this HPU path, so it should not be treated
-as full FP8 compute. The server enables Habana inference settings, int32 token
-inputs, and KV cache explicitly, but the main remaining bottleneck is the
-single-HPU Transformers execution path.
+The server enables Habana inference settings, int32 token inputs, and KV cache
+explicitly, but the main remaining bottleneck is the single-HPU Transformers
+execution path.
 
 ```bash
 HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python chat_server.py \
   --host 0.0.0.0 \
-  --model-id Qwen/Qwen3.6-27B
+  --model-id Qwen/Qwen3-32B
 ```
 
 ## CLI
@@ -171,9 +191,7 @@ HF_HOME=$PWD/hf_cache PT_HPU_WEIGHT_SHARING=0 \
   --prompt "日本語で短く自己紹介して"
 ```
 
-This venv supports Qwen3 models such as `Qwen/Qwen3-32B`. It does not support
-Qwen3.6 checkpoints such as `Qwen/Qwen3.6-27B`, because those require the newer
-`qwen3_5` architecture in Transformers 5.x.
+This venv supports Qwen3 models such as `Qwen/Qwen3-32B`.
 
 `Qwen/Qwen3-235B-A22B` is available as a Qwen3 causal LM option. The current demo
 uses a single-HPU Transformers placement, so this checkpoint requires enough HPU
