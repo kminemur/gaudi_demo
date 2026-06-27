@@ -729,6 +729,7 @@ HTML = """<!doctype html>
     let currentUserId = sessionStorage.getItem("gaudiChatUserId") || initialUserId;
     let currentDisplayName = sessionStorage.getItem("gaudiChatDisplayName") || initialDisplayName;
     let currentThreadId = sessionStorage.getItem("gaudiChatThreadId") || initialThreadId || "default";
+    let threadListSignature = "";
     if (initialUserId && !sessionStorage.getItem("gaudiChatUserId")) {
       sessionStorage.setItem("gaudiChatUserId", initialUserId);
       sessionStorage.setItem("gaudiChatDisplayName", initialDisplayName || initialUserId);
@@ -837,7 +838,18 @@ HTML = """<!doctype html>
       if (data.length > 0 && !data.some((thread) => thread.thread_id === currentThreadId)) {
         currentThreadId = data[0].thread_id;
       }
-      renderThreadList(data);
+      const signature = JSON.stringify((data || []).map((thread) => [
+        thread.thread_id,
+        thread.title,
+        thread.message_count,
+        thread.updated_at,
+        thread.running,
+        thread.thread_id === currentThreadId
+      ]));
+      if (signature !== threadListSignature) {
+        threadListSignature = signature;
+        renderThreadList(data);
+      }
     }
 
     async function loadThread(threadId) {
@@ -1080,6 +1092,8 @@ HTML = """<!doctype html>
       addMessage("user", prompt);
       chatHistory.push({ role: "user", content: prompt });
       const requestId = makeRequestId();
+      const jobThreadId = currentThreadId;
+      const requestMessages = chatHistory.slice();
       const assistantNode = addMessage("assistant", "キューに追加しています...");
       const stepsNode = addStepPanel();
       renderSteps(stepsNode, clientInitialSteps(agentModeEl.value));
@@ -1091,8 +1105,8 @@ HTML = """<!doctype html>
           body: JSON.stringify({
             request_id: requestId,
             user_id: currentUserId,
-            thread_id: currentThreadId,
-            messages: chatHistory,
+            thread_id: jobThreadId,
+            messages: requestMessages,
             model_id: modelEl.value,
             reasoning_effort: reasoningEl.value,
             agent_mode: agentModeEl.value
@@ -1108,6 +1122,8 @@ HTML = """<!doctype html>
         setStatus("queued", "busy");
         finishActivity("ジョブを受け付けました");
 
+        let lastStepUpdatedAt = 0;
+        let lastJobUpdatedAt = 0;
         const poll = setInterval(async () => {
           try {
             const [stepsRes, jobRes] = await Promise.all([
@@ -1116,14 +1132,19 @@ HTML = """<!doctype html>
             ]);
             if (stepsRes.ok) {
               const stepData = await stepsRes.json();
-              renderSteps(stepsNode, stepData.steps);
-              const summary = activeStepSummary(stepData.steps);
-              if (summary && !stepData.done) {
-                assistantNode.textContent = summary;
+              if ((stepData.updated_at || 0) !== lastStepUpdatedAt) {
+                lastStepUpdatedAt = stepData.updated_at || 0;
+                renderSteps(stepsNode, stepData.steps);
+                const summary = activeStepSummary(stepData.steps);
+                if (summary && !stepData.done) {
+                  assistantNode.textContent = summary;
+                }
               }
             }
             if (!jobRes.ok) return;
             const job = await jobRes.json();
+            if ((job.updated_at || 0) === lastJobUpdatedAt && !job.done) return;
+            lastJobUpdatedAt = job.updated_at || 0;
             if (!job.done) return;
             clearInterval(poll);
             if (job.error) {
@@ -1132,10 +1153,12 @@ HTML = """<!doctype html>
               return;
             }
             const finalData = job.response;
-            assistantNode.textContent = finalData.reply || "";
-            addMetrics(finalData);
-            addSources(finalData.sources);
-            chatHistory.push({ role: "assistant", content: finalData.reply || "" });
+            if (currentThreadId === jobThreadId) {
+              assistantNode.textContent = finalData.reply || "";
+              addMetrics(finalData);
+              addSources(finalData.sources);
+              chatHistory.push({ role: "assistant", content: finalData.reply || "" });
+            }
             await loadThreads();
             setStatus("ready", "ready");
           } catch (error) {
@@ -1261,7 +1284,6 @@ HTML = """<!doctype html>
       showLogin();
     }
     refreshHealth();
-    setInterval(refreshHealth, 10000);
   </script>
 </body>
 </html>
@@ -1309,8 +1331,6 @@ def render_html(
         shell,
         flags=re.DOTALL,
     )
-    if active_job and not active_job.get("done"):
-        shell = shell.replace("</head>", '  <meta http-equiv="refresh" content="2">\n</head>')
     if user_id:
         rendered_messages = ['        <div class="message system">選択した Qwen モデルが Intel Gaudi HPU 上で応答します。</div>']
         for message in messages or []:
@@ -1782,6 +1802,59 @@ class HistoryStore:
                 thread["last_model_id"] = last_model_id
             record["active_thread_id"] = normalized_thread_id
             record["messages"] = serialized if normalized_thread_id == "default" else record.get("messages", [])
+            record["updated_at"] = now
+            self._save_unlocked(data)
+
+    def append_message(
+        self,
+        user_id: str,
+        thread_id: str,
+        message: ChatMessage,
+        last_mode: str | None = None,
+        last_model_id: str | None = None,
+    ) -> None:
+        normalized_user_id = self._user_id(user_id)
+        normalized_thread_id = self._thread_id(thread_id)
+        with self.lock:
+            data = self._load_unlocked()
+            users = data.setdefault("users", {})
+            record = users.get(normalized_user_id)
+            if record is None:
+                record = {
+                    "display_name": normalized_user_id,
+                    "messages": [],
+                    "created_at": self._now(),
+                }
+                users[normalized_user_id] = record
+            threads = self._ensure_threads_unlocked(record)
+            if normalized_thread_id not in threads:
+                now = self._now()
+                threads[normalized_thread_id] = {
+                    "title": self._thread_title(None, [message]),
+                    "messages": [],
+                    "created_at": now,
+                    "updated_at": now,
+                    "last_mode": "auto",
+                    "last_model_id": None,
+                    "archived": False,
+                }
+            thread = threads[normalized_thread_id]
+            messages = thread.get("messages")
+            if not isinstance(messages, list):
+                messages = []
+                thread["messages"] = messages
+            messages.append(message.model_dump())
+            if not thread.get("title") or thread.get("title") == "新しいスレッド":
+                thread["title"] = self._thread_title(None, messages)
+            now = self._now()
+            thread["updated_at"] = now
+            if last_mode:
+                thread["last_mode"] = last_mode
+            if last_model_id:
+                thread["last_model_id"] = last_model_id
+            record["active_thread_id"] = normalized_thread_id
+            if normalized_thread_id == "default":
+                record["messages"] = messages
             record["updated_at"] = now
             self._save_unlocked(data)
 
@@ -2946,13 +3019,10 @@ def create_app(model_id: str) -> FastAPI:
                     "search_decision": search_decision,
                 }
             )
-            history = history_store.thread_history(request.user_id, request.thread_id)
-            saved_messages = list(history.messages)
-            saved_messages.append(ChatMessage(role="assistant", content=response.reply))
-            history_store.replace_history(
+            history_store.append_message(
                 request.user_id,
-                saved_messages,
                 request.thread_id,
+                ChatMessage(role="assistant", content=response.reply),
                 last_mode=request.agent_mode,
                 last_model_id=request.model_id,
             )
@@ -2987,14 +3057,9 @@ def create_app(model_id: str) -> FastAPI:
         cancel_event = cancel_event_for(request_id)
         cancel_event.clear()
         set_progress_thread(request_id, request.user_id, request.thread_id)
-        history_store.replace_history(
-            request.user_id,
-            request.messages,
-            request.thread_id,
-            last_mode=request.agent_mode,
-            last_model_id=request.model_id,
-        )
         with progress_lock:
+            if request_id in async_jobs:
+                return {"request_id": request_id, "queued": True}
             async_jobs[request_id] = {
                 "request_id": request_id,
                 "done": False,
@@ -3002,6 +3067,13 @@ def create_app(model_id: str) -> FastAPI:
                 "error": None,
                 "updated_at": time.time(),
             }
+        history_store.append_message(
+            request.user_id,
+            request.thread_id,
+            request.messages[-1],
+            last_mode=request.agent_mode,
+            last_model_id=request.model_id,
+        )
         worker = threading.Thread(target=execute_chat_job, args=(request_id, request), daemon=True)
         worker.start()
         return {"request_id": request_id, "queued": True}
