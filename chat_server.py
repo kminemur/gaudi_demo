@@ -647,7 +647,7 @@ HTML = """<!doctype html>
 
       <div class="threadbar">
         <div class="thread-current">現在のスレッド<strong id="currentThreadTitle">メイン</strong></div>
-        <button id="newThread" class="secondary" type="button">新規スレッド</button>
+        <a id="newThread" class="secondary action-link" href="/threads/new">新規スレッド</a>
         <button id="renameThread" class="secondary" type="button">名前変更</button>
         <button id="deleteThread" class="secondary" type="button">削除</button>
         <div id="threadList" class="thread-list"></div>
@@ -725,7 +725,7 @@ HTML = """<!doctype html>
     let activityTimer = null;
     const initialUserId = document.body.dataset.initialUserId || "";
     const initialDisplayName = document.body.dataset.initialDisplayName || "";
-    const initialThreadId = document.body.dataset.initial-thread-id || "default";
+    const initialThreadId = document.body.dataset.initialThreadId || "default";
     let currentUserId = sessionStorage.getItem("gaudiChatUserId") || initialUserId;
     let currentDisplayName = sessionStorage.getItem("gaudiChatDisplayName") || initialDisplayName;
     let currentThreadId = sessionStorage.getItem("gaudiChatThreadId") || initialThreadId || "default";
@@ -1232,7 +1232,8 @@ HTML = """<!doctype html>
       finishActivity("履歴を削除しました");
     });
 
-    newThreadEl.addEventListener("click", async () => {
+    newThreadEl.addEventListener("click", async (event) => {
+      event.preventDefault();
       try {
         await createThread();
       } catch (error) {
@@ -1296,7 +1297,7 @@ def split_html_script() -> tuple[str, str]:
     start = HTML.index(script_open)
     end = HTML.index(script_close, start)
     script = HTML[start + len(script_open) : end].strip()
-    shell = HTML[:start] + '  <script src="/app.js?v=6" defer></script>\n' + HTML[end + len(script_close) :]
+    shell = HTML[:start] + '  <script src="/app.js?v=7" defer></script>\n' + HTML[end + len(script_close) :]
     return shell, script
 
 
@@ -2694,6 +2695,14 @@ def create_app(model_id: str) -> FastAPI:
         response.delete_cookie("gaudi_chat_user_id")
         response.delete_cookie("gaudi_chat_display_name")
         return response
+
+    @app.get("/threads/new")
+    def new_thread_fallback(request: Request) -> RedirectResponse:
+        user_id = request.cookies.get("gaudi_chat_user_id", "")
+        if not user_id:
+            return RedirectResponse("/", status_code=303)
+        thread = history_store.create_thread(user_id)
+        return RedirectResponse(f"/?thread_id={thread.thread_id}", status_code=303)
 
     def run_fallback_chat(job_id: str, chat_request: ChatRequest) -> None:
         steps = initial_steps(chat_request.agent_mode)
