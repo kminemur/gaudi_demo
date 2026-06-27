@@ -3,6 +3,10 @@
 Run Qwen models on Intel Gaudi HPU. The chat server defaults to
 `Qwen/Qwen3.6-27B`.
 
+## Docs
+
+- [AI Agent Specification with Intel Gaudi](docs/ai_agent_gaudi_spec.md)
+
 ## Chat UI
 
 Start a web chat server bound to all interfaces. The server uses port `8000` by
@@ -58,12 +62,16 @@ The reasoning strength selector changes the speed/depth tradeoff:
 
 The agent mode selector is applied per message:
 
+- `Auto`: decide whether web search is needed, then answer with or without sources
 - `Chat`: answer with the selected model only
-- `Web検索`: search DuckDuckGo once, then answer with sources
 - `Deep search`: run multiple DuckDuckGo searches, then answer with broader source context
 
 DuckDuckGo is the default search engine. To temporarily switch back to Bing,
 start the server with `SEARCH_ENGINE=bing`.
+
+The chat screen supports multiple threads per user. Use the thread list to switch
+topics without mixing conversation history. The default `Auto` mode makes a
+per-message search decision inside the active thread.
 
 While a message is running, the UI shows agent steps such as web search,
 source preparation, prompt construction, model generation, and completion.

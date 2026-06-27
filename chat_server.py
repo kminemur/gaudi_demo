@@ -62,6 +62,7 @@ SERVER_PORT = int(os.environ.get("SERVER_PORT", DEFAULT_SERVER_PORT))
 HISTORY_PATH = Path(os.environ.get("CHAT_HISTORY_PATH", "chat_history.json"))
 SEARCH_ENGINE = os.environ.get("SEARCH_ENGINE", "duckduckgo")
 SEARCH_TIMEOUT_SEC = float(os.environ.get("SEARCH_TIMEOUT_SEC", "8"))
+AUTO_SEARCH_DEFAULT = os.environ.get("AUTO_SEARCH_DEFAULT", "1") == "1"
 HPU_EXECUTION_MODE = "lazy" if os.environ.get("PT_HPU_LAZY_MODE") == "1" else "eager"
 USE_INT32_INPUTS = os.environ.get("USE_INT32_INPUTS", "1") == "1"
 MODEL_PLACEMENT = "single_hpu_transformers"
@@ -141,9 +142,13 @@ REASONING_PRESETS = {
     },
 }
 AGENT_MODES = {
+    "auto": {"label": "Auto", "description": "必要な場合だけ自動検索して応答"},
     "chat": {"label": "Chat", "description": "モデルだけで応答"},
     "web": {"label": "Web検索", "description": "Web検索結果を参照して応答"},
     "deep": {"label": "Deep search", "description": "複数検索で広めに調べて応答"},
+}
+USER_AGENT_MODES = {
+    key: value for key, value in AGENT_MODES.items() if key in {"auto", "chat", "deep"}
 }
 AGENT_MODE_MIN_TOKENS = {
     "deep": 4096,
@@ -265,6 +270,63 @@ HTML = """<!doctype html>
       overflow-wrap: anywhere;
     }
 
+    .threadbar {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .thread-current {
+      display: grid;
+      gap: 2px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .thread-current strong {
+      color: var(--ink);
+      font-size: 14px;
+      overflow-wrap: anywhere;
+    }
+
+    .thread-list {
+      grid-column: 1 / -1;
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      padding-bottom: 2px;
+    }
+
+    .thread-item {
+      height: 34px;
+      flex: 0 0 auto;
+      display: inline-grid;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fbfbf9;
+      color: var(--ink);
+      padding: 0 10px;
+      font-size: 13px;
+      cursor: pointer;
+      max-width: 220px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      text-decoration: none;
+    }
+
+    .thread-item.active {
+      border-color: var(--accent);
+      background: #e6f3f0;
+      font-weight: 700;
+    }
+
     .activitybar {
       display: grid;
       grid-template-columns: minmax(110px, auto) 1fr auto;
@@ -317,6 +379,10 @@ HTML = """<!doctype html>
 
     @media (max-width: 720px) {
       .activitybar {
+        grid-template-columns: 1fr;
+      }
+
+      .threadbar {
         grid-template-columns: 1fr;
       }
 
@@ -579,6 +645,12 @@ HTML = """<!doctype html>
         <a id="logout" class="secondary action-link" href="/logout">ログアウト</a>
       </div>
 
+      <div class="threadbar">
+        <div class="thread-current">現在のスレッド<strong id="currentThreadTitle">メイン</strong></div>
+        <button id="newThread" class="secondary" type="button">新規スレッド</button>
+        <div id="threadList" class="thread-list"></div>
+      </div>
+
       <div id="activityBar" class="activitybar ready">
         <div id="activityMode" class="activity-mode">待機中</div>
         <div id="activityDetail" class="activity-detail">メッセージを送信できます</div>
@@ -590,6 +662,7 @@ HTML = """<!doctype html>
       </div>
 
       <form id="chatForm" action="/chat/send" method="post">
+        <input id="threadId" name="thread_id" type="hidden" value="default" />
         <select id="model" name="model_id" aria-label="model">
           <option value="Qwen/Qwen3.6-27B" selected>Qwen3.6 27B</option>
           <option value="Qwen/Qwen3.6-27B-FP8">Qwen3.6 27B FP8</option>
@@ -602,8 +675,8 @@ HTML = """<!doctype html>
           <option value="high">High</option>
         </select>
         <select id="agentMode" name="agent_mode" aria-label="agent mode">
-          <option value="chat" selected>Chat</option>
-          <option value="web">Web検索</option>
+          <option value="auto" selected>Auto</option>
+          <option value="chat">Chat</option>
           <option value="deep">Deep search</option>
         </select>
         <textarea id="prompt" name="prompt" autocomplete="off" placeholder="メッセージを入力" autofocus></textarea>
@@ -626,6 +699,10 @@ HTML = """<!doctype html>
     const loginNameEl = document.querySelector("#loginName");
     const loginErrorEl = document.querySelector("#loginError");
     const currentUserNameEl = document.querySelector("#currentUserName");
+    const currentThreadTitleEl = document.querySelector("#currentThreadTitle");
+    const threadListEl = document.querySelector("#threadList");
+    const newThreadEl = document.querySelector("#newThread");
+    const threadIdEl = document.querySelector("#threadId");
     const clearHistoryEl = document.querySelector("#clearHistory");
     const logoutEl = document.querySelector("#logout");
     const dotEl = document.querySelector("#dot");
@@ -644,8 +721,10 @@ HTML = """<!doctype html>
     let activityTimer = null;
     const initialUserId = document.body.dataset.initialUserId || "";
     const initialDisplayName = document.body.dataset.initialDisplayName || "";
+    const initialThreadId = document.body.dataset.initial-thread-id || "default";
     let currentUserId = sessionStorage.getItem("gaudiChatUserId") || initialUserId;
     let currentDisplayName = sessionStorage.getItem("gaudiChatDisplayName") || initialDisplayName;
+    let currentThreadId = sessionStorage.getItem("gaudiChatThreadId") || initialThreadId || "default";
     if (initialUserId && !sessionStorage.getItem("gaudiChatUserId")) {
       sessionStorage.setItem("gaudiChatUserId", initialUserId);
       sessionStorage.setItem("gaudiChatDisplayName", initialDisplayName || initialUserId);
@@ -734,6 +813,56 @@ HTML = """<!doctype html>
       }
     }
 
+    function renderThreadList(threads) {
+      threadListEl.innerHTML = "";
+      for (const thread of threads || []) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = `thread-item${thread.thread_id === currentThreadId ? " active" : ""}`;
+        button.textContent = thread.title || "新しいスレッド";
+        button.title = `${thread.title || "新しいスレッド"} · ${thread.message_count || 0}件`;
+        button.addEventListener("click", () => loadThread(thread.thread_id));
+        threadListEl.appendChild(button);
+      }
+    }
+
+    async function loadThreads() {
+      if (!currentUserId) return;
+      const { res, data } = await fetchJson(`/api/threads/${encodeURIComponent(currentUserId)}`);
+      if (!res.ok) throw new Error(data.detail || "スレッド一覧を読み込めませんでした");
+      if (data.length > 0 && !data.some((thread) => thread.thread_id === currentThreadId)) {
+        currentThreadId = data[0].thread_id;
+      }
+      renderThreadList(data);
+    }
+
+    async function loadThread(threadId) {
+      if (!currentUserId) return;
+      const { res, data } = await fetchJson(
+        `/api/threads/${encodeURIComponent(currentUserId)}/${encodeURIComponent(threadId)}`
+      );
+      if (!res.ok) throw new Error(data.detail || "スレッドを読み込めませんでした");
+      currentThreadId = data.thread_id;
+      sessionStorage.setItem("gaudiChatThreadId", currentThreadId);
+      threadIdEl.value = currentThreadId;
+      currentThreadTitleEl.textContent = data.title || "新しいスレッド";
+      renderConversation(data.messages);
+      await loadThreads();
+      showChat();
+    }
+
+    async function createThread() {
+      if (!currentUserId || isRunning) return;
+      const { res, data } = await fetchJson("/api/threads", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: currentUserId })
+      });
+      if (!res.ok) throw new Error(data.detail || "スレッドを作成できませんでした");
+      await loadThread(data.thread_id);
+      finishActivity("新しいスレッドを作成しました");
+    }
+
     function showLogin() {
       chatViewEl.classList.add("hidden");
       loginViewEl.classList.remove("hidden");
@@ -749,11 +878,18 @@ HTML = """<!doctype html>
     }
 
     async function loadHistory(userId) {
-      const { res, data } = await fetchJson(`/api/history/${encodeURIComponent(userId)}`);
+      await loadThreads();
+      const { res, data } = await fetchJson(
+        `/api/threads/${encodeURIComponent(userId)}/${encodeURIComponent(currentThreadId)}`
+      );
       if (!res.ok) throw new Error(data.detail || "履歴を読み込めませんでした");
       renderConversation(data.messages);
       currentDisplayName = data.display_name;
+      currentThreadId = data.thread_id;
+      threadIdEl.value = currentThreadId;
       currentUserNameEl.textContent = currentDisplayName;
+      currentThreadTitleEl.textContent = data.title || "メイン";
+      await loadThreads();
     }
 
     async function login(displayName) {
@@ -767,6 +903,8 @@ HTML = """<!doctype html>
       currentDisplayName = data.display_name;
       sessionStorage.setItem("gaudiChatUserId", currentUserId);
       sessionStorage.setItem("gaudiChatDisplayName", currentDisplayName);
+      currentThreadId = "default";
+      sessionStorage.setItem("gaudiChatThreadId", currentThreadId);
       renderConversation([]);
       showChat();
       setStatus("ready", "ready");
@@ -782,7 +920,8 @@ HTML = """<!doctype html>
     function addMetrics(data) {
       const node = document.createElement("div");
       node.className = "metrics";
-      node.textContent = `${data.agent_mode.toUpperCase()} · ${data.reasoning_effort.toUpperCase()} · TTFT ${data.ttft_sec.toFixed(2)}s · TPS ${data.tokens_per_sec.toFixed(2)} tok/s · ${data.generated_tokens} tokens`;
+      const mode = data.resolved_mode ? `${data.agent_mode.toUpperCase()}→${data.resolved_mode.toUpperCase()}` : data.agent_mode.toUpperCase();
+      node.textContent = `${mode} · ${data.reasoning_effort.toUpperCase()} · TTFT ${data.ttft_sec.toFixed(2)}s · TPS ${data.tokens_per_sec.toFixed(2)} tok/s · ${data.generated_tokens} tokens`;
       messagesEl.appendChild(node);
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
@@ -807,8 +946,11 @@ HTML = """<!doctype html>
 
     function clientInitialSteps(mode) {
       const steps = [{ label: "リクエスト受付", status: "done", detail: mode.toUpperCase() }];
-      if (mode === "web" || mode === "deep") {
-        steps.push({ label: "Web検索", status: "active", detail: "検索開始を待っています" });
+      if (mode === "auto") {
+        steps.push({ label: "検索要否判定", status: "active", detail: "検索が必要か判定しています" });
+      }
+      if (mode === "deep") {
+        steps.push({ label: "Deep search", status: "active", detail: "検索開始を待っています" });
         steps.push({ label: "検索結果の整理", status: "pending", detail: "" });
       }
       steps.push({ label: "プロンプト作成", status: "pending", detail: "" });
@@ -907,10 +1049,9 @@ HTML = """<!doctype html>
       const requestId = makeRequestId();
       activeRequestId = requestId;
       activeController = new AbortController();
-      const assistantNode = addMessage("assistant", agentModeEl.value === "chat" ? "生成中..." : `${modeLabel} 中...`);
+      const assistantNode = addMessage("assistant", agentModeEl.value === "chat" ? "生成中..." : `${modeLabel} で回答作成中...`);
       const stepsNode = addStepPanel();
       renderSteps(stepsNode, clientInitialSteps(agentModeEl.value));
-      addMessage("system", `mode=${agentModeEl.value} / request=${requestId}`);
       const stepPoll = setInterval(async () => {
         try {
           const res = await fetch(`/api/agent_steps/${encodeURIComponent(requestId)}`);
@@ -931,6 +1072,7 @@ HTML = """<!doctype html>
           body: JSON.stringify({
             request_id: requestId,
             user_id: currentUserId,
+            thread_id: currentThreadId,
             messages: chatHistory,
             model_id: modelEl.value,
             reasoning_effort: reasoningEl.value,
@@ -991,6 +1133,7 @@ HTML = """<!doctype html>
         addMetrics(finalData);
         addSources(finalData.sources);
         chatHistory.push({ role: "assistant", content: finalData.reply || streamedText || "" });
+        await loadThreads();
         setStatus("ready", "ready");
         finishActivity(`${modeLabel} 完了`);
       } catch (error) {
@@ -1067,9 +1210,18 @@ HTML = """<!doctype html>
 
     clearHistoryEl.addEventListener("click", async () => {
       if (isRunning) return;
-      await fetch(`/api/history/${encodeURIComponent(currentUserId)}`, { method: "DELETE" });
+      await fetch(`/api/history/${encodeURIComponent(currentUserId)}?thread_id=${encodeURIComponent(currentThreadId)}`, { method: "DELETE" });
       renderConversation([]);
+      await loadThreads();
       finishActivity("履歴を削除しました");
+    });
+
+    newThreadEl.addEventListener("click", async () => {
+      try {
+        await createThread();
+      } catch (error) {
+        addMessage("system", `スレッドを作成できませんでした: ${error.message}`);
+      }
     });
 
     logoutEl.addEventListener("click", async () => {
@@ -1079,8 +1231,10 @@ HTML = """<!doctype html>
       } catch (_error) {}
       sessionStorage.removeItem("gaudiChatUserId");
       sessionStorage.removeItem("gaudiChatDisplayName");
+      sessionStorage.removeItem("gaudiChatThreadId");
       currentUserId = "";
       currentDisplayName = "";
+      currentThreadId = "default";
       renderConversation([]);
       showLogin();
     });
@@ -1120,10 +1274,15 @@ def render_html(
     display_name: str = "",
     messages: list | None = None,
     active_job: dict | None = None,
+    thread_id: str = "default",
+    thread_title: str = "メイン",
+    threads: list | None = None,
 ) -> str:
     shell, _ = split_html_script()
     safe_user_id = html.escape(user_id, quote=True)
     safe_display_name = html.escape(display_name or user_id, quote=True)
+    safe_thread_id = html.escape(thread_id or "default", quote=True)
+    safe_thread_title = html.escape(thread_title or "メイン")
     model_options = "\n".join(
         f'          <option value="{html.escape(model_id, quote=True)}"'
         f'{" selected" if model_id == DEFAULT_MODEL_ID else ""}>'
@@ -1132,7 +1291,8 @@ def render_html(
     )
     shell = shell.replace(
         '<body data-initial-user-id="" data-initial-display-name="">',
-        f'<body data-initial-user-id="{safe_user_id}" data-initial-display-name="{safe_display_name}">',
+        f'<body data-initial-user-id="{safe_user_id}" data-initial-display-name="{safe_display_name}" '
+        f'data-initial-thread-id="{safe_thread_id}">',
     )
     shell = re.sub(
         r'        <select id="model" name="model_id" aria-label="model">.*?</select>',
@@ -1188,6 +1348,27 @@ def render_html(
             '<strong id="currentUserName"></strong>',
             f'<strong id="currentUserName">{safe_display_name}</strong>',
         )
+        shell = shell.replace(
+            '<strong id="currentThreadTitle">メイン</strong>',
+            f'<strong id="currentThreadTitle">{safe_thread_title}</strong>',
+        )
+        shell = shell.replace(
+            '<input id="threadId" name="thread_id" type="hidden" value="default" />',
+            f'<input id="threadId" name="thread_id" type="hidden" value="{safe_thread_id}" />',
+        )
+        if threads:
+            rendered_threads = []
+            for thread in threads:
+                active_class = " active" if thread.thread_id == thread_id else ""
+                rendered_threads.append(
+                    f'<a class="thread-item{active_class}" '
+                    f'href="/?thread_id={html.escape(thread.thread_id, quote=True)}">'
+                    f'{html.escape(thread.title)}</a>'
+                )
+            shell = shell.replace(
+                '<div id="threadList" class="thread-list"></div>',
+                f'<div id="threadList" class="thread-list">{"".join(rendered_threads)}</div>',
+            )
         if active_job:
             state = "ready" if active_job.get("done") else "busy"
             mode = html.escape(active_job.get("mode", "回答作成中"))
@@ -1228,10 +1409,11 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     request_id: str | None = None
     user_id: str = "default"
+    thread_id: str = "default"
     model_id: str = DEFAULT_MODEL_ID
     messages: list[ChatMessage] = Field(min_length=1)
     reasoning_effort: Literal["low", "medium", "high"] = "medium"
-    agent_mode: Literal["chat", "web", "deep"] = "chat"
+    agent_mode: Literal["auto", "chat", "deep"] = "auto"
     max_new_tokens: int | None = Field(default=None, ge=1, le=4096)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     top_p: float = Field(default=0.9, ge=0.05, le=1.0)
@@ -1260,6 +1442,36 @@ class HistoryResponse(BaseModel):
     messages: list[ChatMessage]
 
 
+class ThreadRequest(BaseModel):
+    user_id: str = "default"
+    title: str | None = Field(default=None, max_length=120)
+
+
+class ThreadUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=120)
+    archived: bool | None = None
+
+
+class ThreadSummary(BaseModel):
+    thread_id: str
+    title: str
+    message_count: int
+    last_mode: str = "auto"
+    last_model_id: str | None = None
+    updated_at: str | None = None
+    running: bool = False
+
+
+class ThreadHistoryResponse(BaseModel):
+    user_id: str
+    display_name: str
+    thread_id: str
+    title: str
+    messages: list[ChatMessage]
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
 class SearchResult(BaseModel):
     title: str
     url: str
@@ -1282,6 +1494,8 @@ class ChatResponse(BaseModel):
     precision: str
     reasoning_effort: str
     agent_mode: str
+    resolved_mode: str = "chat"
+    search_decision: str = ""
     sources: list[SearchResult] = Field(default_factory=list)
     effective_max_new_tokens: int
     enable_thinking: bool
@@ -1307,6 +1521,43 @@ class HistoryStore:
         raw = (value or display_name or "default").strip().lower()
         user_id = re.sub(r"[^a-z0-9_.-]+", "-", raw).strip("-._")
         return user_id[:64] or "default"
+
+    def _thread_id(self, value: str | None = None) -> str:
+        raw = (value or str(uuid.uuid4())).strip().lower()
+        thread_id = re.sub(r"[^a-z0-9_.-]+", "-", raw).strip("-._")
+        return thread_id[:80] or str(uuid.uuid4())
+
+    def _thread_title(self, title: str | None, messages: list | None = None) -> str:
+        if title and title.strip():
+            return title.strip()[:80]
+        for message in messages or []:
+            content = message.get("content", "") if isinstance(message, dict) else getattr(message, "content", "")
+            role = message.get("role", "") if isinstance(message, dict) else getattr(message, "role", "")
+            if role == "user" and content:
+                return content.strip().replace("\n", " ")[:40] or "新しいスレッド"
+        return "新しいスレッド"
+
+    def _ensure_threads_unlocked(self, record: dict) -> dict:
+        threads = record.get("threads")
+        if not isinstance(threads, dict):
+            legacy_messages = record.get("messages") if isinstance(record.get("messages"), list) else []
+            created_at = record.get("created_at") or self._now()
+            updated_at = record.get("updated_at") or created_at
+            threads = {
+                "default": {
+                    "title": self._thread_title("メイン", legacy_messages),
+                    "messages": legacy_messages,
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                    "last_mode": "auto",
+                    "last_model_id": None,
+                    "archived": False,
+                }
+            }
+            record["threads"] = threads
+        if "active_thread_id" not in record or record["active_thread_id"] not in threads:
+            record["active_thread_id"] = "default" if "default" in threads else next(iter(threads), "default")
+        return threads
 
     def _load_unlocked(self) -> dict:
         if not self.path.exists():
@@ -1349,6 +1600,7 @@ class HistoryStore:
             elif display_name:
                 record["display_name"] = label
                 record["updated_at"] = self._now()
+            self._ensure_threads_unlocked(record)
             self._save_unlocked(data)
             return {"user_id": normalized_user_id, **record}
 
@@ -1371,20 +1623,111 @@ class HistoryStore:
 
     def history(self, user_id: str) -> HistoryResponse:
         record = self.ensure_user(user_id)
+        active_thread_id = record.get("active_thread_id", "default")
+        return self.thread_history(user_id, active_thread_id)
+
+    def list_threads(self, user_id: str) -> list[ThreadSummary]:
+        normalized_user_id = self._user_id(user_id)
+        self.ensure_user(normalized_user_id)
+        with self.lock:
+            data = self._load_unlocked()
+            record = data["users"].get(normalized_user_id, {})
+            threads = self._ensure_threads_unlocked(record)
+            summaries = []
+            for thread_id, thread in threads.items():
+                if thread.get("archived"):
+                    continue
+                messages = thread.get("messages") if isinstance(thread.get("messages"), list) else []
+                summaries.append(
+                    ThreadSummary(
+                        thread_id=thread_id,
+                        title=thread.get("title") or self._thread_title(None, messages),
+                        message_count=len(messages),
+                        last_mode=thread.get("last_mode", "auto"),
+                        last_model_id=thread.get("last_model_id"),
+                        updated_at=thread.get("updated_at"),
+                    )
+                )
+        return sorted(summaries, key=lambda thread: thread.updated_at or "", reverse=True)
+
+    def create_thread(self, user_id: str, title: str | None = None) -> ThreadHistoryResponse:
+        normalized_user_id = self._user_id(user_id)
+        with self.lock:
+            data = self._load_unlocked()
+            users = data.setdefault("users", {})
+            record = users.get(normalized_user_id)
+            if record is None:
+                record = {
+                    "display_name": normalized_user_id,
+                    "messages": [],
+                    "created_at": self._now(),
+                    "updated_at": self._now(),
+                }
+                users[normalized_user_id] = record
+            threads = self._ensure_threads_unlocked(record)
+            thread_id = self._thread_id()
+            now = self._now()
+            threads[thread_id] = {
+                "title": self._thread_title(title),
+                "messages": [],
+                "created_at": now,
+                "updated_at": now,
+                "last_mode": "auto",
+                "last_model_id": None,
+                "archived": False,
+            }
+            record["active_thread_id"] = thread_id
+            record["updated_at"] = now
+            self._save_unlocked(data)
+            return ThreadHistoryResponse(
+                user_id=normalized_user_id,
+                display_name=record.get("display_name", normalized_user_id),
+                thread_id=thread_id,
+                title=threads[thread_id]["title"],
+                messages=[],
+                created_at=now,
+                updated_at=now,
+            )
+
+    def thread_history(self, user_id: str, thread_id: str = "default") -> ThreadHistoryResponse:
+        normalized_user_id = self._user_id(user_id)
+        record = self.ensure_user(normalized_user_id)
+        normalized_thread_id = self._thread_id(thread_id)
+        with self.lock:
+            data = self._load_unlocked()
+            record = data["users"].get(normalized_user_id, record)
+            threads = self._ensure_threads_unlocked(record)
+            if normalized_thread_id not in threads:
+                normalized_thread_id = record.get("active_thread_id", "default")
+            thread = threads.get(normalized_thread_id) or threads["default"]
+            record["active_thread_id"] = normalized_thread_id
+            self._save_unlocked(data)
         messages = []
-        for message in record.get("messages", []):
+        for message in thread.get("messages", []):
             try:
                 messages.append(ChatMessage(**message))
             except Exception:
                 continue
-        return HistoryResponse(
-            user_id=record["user_id"],
-            display_name=record.get("display_name", record["user_id"]),
+        return ThreadHistoryResponse(
+            user_id=normalized_user_id,
+            display_name=record.get("display_name", normalized_user_id),
+            thread_id=normalized_thread_id,
+            title=thread.get("title") or self._thread_title(None, messages),
             messages=messages,
+            created_at=thread.get("created_at"),
+            updated_at=thread.get("updated_at"),
         )
 
-    def replace_history(self, user_id: str, messages: list[ChatMessage]) -> None:
+    def replace_history(
+        self,
+        user_id: str,
+        messages: list[ChatMessage],
+        thread_id: str = "default",
+        last_mode: str | None = None,
+        last_model_id: str | None = None,
+    ) -> None:
         normalized_user_id = self._user_id(user_id)
+        normalized_thread_id = self._thread_id(thread_id)
         with self.lock:
             data = self._load_unlocked()
             users = data["users"]
@@ -1396,19 +1739,78 @@ class HistoryStore:
                     "created_at": self._now(),
                 }
                 users[normalized_user_id] = record
-            record["messages"] = [message.model_dump() for message in messages]
-            record["updated_at"] = self._now()
+            threads = self._ensure_threads_unlocked(record)
+            if normalized_thread_id not in threads:
+                now = self._now()
+                threads[normalized_thread_id] = {
+                    "title": self._thread_title(None, messages),
+                    "messages": [],
+                    "created_at": now,
+                    "updated_at": now,
+                    "last_mode": "auto",
+                    "last_model_id": None,
+                    "archived": False,
+                }
+            serialized = [message.model_dump() for message in messages]
+            now = self._now()
+            thread = threads[normalized_thread_id]
+            thread["messages"] = serialized
+            if not thread.get("title") or thread.get("title") == "新しいスレッド":
+                thread["title"] = self._thread_title(None, serialized)
+            thread["updated_at"] = now
+            if last_mode:
+                thread["last_mode"] = last_mode
+            if last_model_id:
+                thread["last_model_id"] = last_model_id
+            record["active_thread_id"] = normalized_thread_id
+            record["messages"] = serialized if normalized_thread_id == "default" else record.get("messages", [])
+            record["updated_at"] = now
             self._save_unlocked(data)
 
-    def clear_history(self, user_id: str) -> None:
+    def update_thread(
+        self,
+        user_id: str,
+        thread_id: str,
+        title: str | None = None,
+        archived: bool | None = None,
+    ) -> ThreadHistoryResponse:
         normalized_user_id = self._user_id(user_id)
+        normalized_thread_id = self._thread_id(thread_id)
+        with self.lock:
+            data = self._load_unlocked()
+            record = data["users"].get(normalized_user_id)
+            if record is None:
+                raise KeyError("user not found")
+            threads = self._ensure_threads_unlocked(record)
+            if normalized_thread_id not in threads:
+                raise KeyError("thread not found")
+            thread = threads[normalized_thread_id]
+            if title is not None and title.strip():
+                thread["title"] = title.strip()[:80]
+            if archived is not None:
+                thread["archived"] = archived
+            thread["updated_at"] = self._now()
+            record["updated_at"] = thread["updated_at"]
+            self._save_unlocked(data)
+        return self.thread_history(normalized_user_id, normalized_thread_id)
+
+    def clear_history(self, user_id: str, thread_id: str = "default") -> None:
+        normalized_user_id = self._user_id(user_id)
+        normalized_thread_id = self._thread_id(thread_id)
         with self.lock:
             data = self._load_unlocked()
             record = data["users"].get(normalized_user_id)
             if record is None:
                 return
-            record["messages"] = []
-            record["updated_at"] = self._now()
+            threads = self._ensure_threads_unlocked(record)
+            thread = threads.get(normalized_thread_id)
+            if thread is None:
+                return
+            thread["messages"] = []
+            thread["updated_at"] = self._now()
+            if normalized_thread_id == "default":
+                record["messages"] = []
+            record["updated_at"] = thread["updated_at"]
             self._save_unlocked(data)
 
 
@@ -1565,6 +1967,68 @@ def collect_sources(prompt: str, mode: str, cancel_event: threading.Event | None
     return SearchBundle(sources=sources, warnings=warnings)
 
 
+AUTO_SEARCH_PATTERNS = [
+    r"最新",
+    r"現在",
+    r"今\b",
+    r"今日",
+    r"昨日",
+    r"明日",
+    r"今年",
+    r"直近",
+    r"速報",
+    r"ニュース",
+    r"障害",
+    r"価格",
+    r"株価",
+    r"為替",
+    r"天気",
+    r"結果",
+    r"日程",
+    r"リリース",
+    r"アップデート",
+    r"検索",
+    r"調べ",
+    r"ソース",
+    r"出典",
+    r"根拠",
+]
+DEEP_SEARCH_PATTERNS = [
+    r"詳しく",
+    r"深く",
+    r"網羅",
+    r"比較",
+    r"複数",
+    r"背景",
+    r"調査",
+    r"まとめて",
+]
+NO_SEARCH_PATTERNS = [
+    r"検索しない",
+    r"調べない",
+    r"外部情報なし",
+]
+
+
+def auto_search_decision(prompt: str, messages: list[ChatMessage] | None = None) -> tuple[str, str]:
+    text = prompt.strip()
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in NO_SEARCH_PATTERNS):
+        return "chat", "ユーザーが検索しないよう指定したため、モデルのみで回答"
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in DEEP_SEARCH_PATTERNS):
+        return "deep", "複数観点の整理が必要なため Deep search を実行"
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in AUTO_SEARCH_PATTERNS):
+        return "web", "最新性または出典確認が必要なため自動検索を実行"
+    return "chat", "検索不要と判断し、モデルのみで回答"
+
+
+def resolve_agent_mode(request: ChatRequest) -> tuple[str, str]:
+    if request.agent_mode == "chat":
+        return "chat", "Chat が選択されたため検索しません"
+    if request.agent_mode == "deep":
+        return "deep", "Deep search が選択されたため詳細検索を実行"
+    return auto_search_decision(request.messages[-1].content, request.messages)
+
+
 def request_with_sources(request: ChatRequest, sources: list[SearchResult]) -> ChatRequest:
     if not sources:
         return request
@@ -1574,7 +2038,8 @@ def request_with_sources(request: ChatRequest, sources: list[SearchResult]) -> C
         f"[{index}] {source.title}\nURL: {source.url}\n概要: {source.snippet}"
         for index, source in enumerate(sources, start=1)
     )
-    mode_name = AGENT_MODES[request.agent_mode]["label"]
+    resolved_mode, _ = resolve_agent_mode(request)
+    mode_name = AGENT_MODES[resolved_mode]["label"]
     enriched = (
         f"{last.content}\n\n"
         f"{mode_name} の検索結果:\n{source_lines}\n\n"
@@ -2001,13 +2466,27 @@ def create_app(model_id: str) -> FastAPI:
 
     def initial_steps(mode: str) -> list[AgentStep]:
         steps = [AgentStep(label="リクエスト受付", status="done", detail=AGENT_MODES[mode]["label"])]
+        if mode == "auto":
+            steps.append(AgentStep(label="検索要否判定", status="pending"))
         if mode in {"web", "deep"}:
-            steps.append(AgentStep(label="Web検索", status="pending"))
+            steps.append(AgentStep(label="自動検索" if mode == "web" else "Deep search", status="pending"))
             steps.append(AgentStep(label="検索結果の整理", status="pending"))
         steps.append(AgentStep(label="プロンプト作成", status="pending"))
         steps.append(AgentStep(label="モデル生成", status="pending"))
         steps.append(AgentStep(label="応答完了", status="pending"))
         return steps
+
+    def insert_search_steps(steps: list[AgentStep], resolved_mode: str) -> int:
+        if resolved_mode not in {"web", "deep"}:
+            return 0
+        insert_at = 2 if len(steps) > 1 and steps[1].label == "検索要否判定" else 1
+        if not any(step.label in {"自動検索", "Deep search", "Web検索"} for step in steps):
+            steps.insert(
+                insert_at,
+                AgentStep(label="自動検索" if resolved_mode == "web" else "Deep search", status="pending"),
+            )
+            steps.insert(insert_at + 1, AgentStep(label="検索結果の整理", status="pending"))
+        return insert_at
 
     def set_fallback_job(job_id: str, **updates) -> None:
         with fallback_lock:
@@ -2051,13 +2530,19 @@ def create_app(model_id: str) -> FastAPI:
         user_id = request.cookies.get("gaudi_chat_user_id", "")
         display_name = unquote(request.cookies.get("gaudi_chat_display_name", user_id))
         job_id = request.query_params.get("job_id", "")
+        thread_id = request.query_params.get("thread_id", "default") or "default"
+        thread_title = "メイン"
+        threads = []
         active_job = None
         messages = []
         if user_id:
             try:
-                history = history_store.history(user_id)
+                history = history_store.thread_history(user_id, thread_id)
                 display_name = history.display_name
                 messages = history.messages
+                thread_id = history.thread_id
+                thread_title = history.title
+                threads = history_store.list_threads(user_id)
             except Exception:
                 messages = []
             if job_id:
@@ -2066,7 +2551,7 @@ def create_app(model_id: str) -> FastAPI:
                     if record and record.get("user_id") == user_id:
                         active_job = dict(record)
         return HTMLResponse(
-            render_html(user_id, display_name, messages, active_job),
+            render_html(user_id, display_name, messages, active_job, thread_id, thread_title, threads),
             headers={
                 "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
                 "Pragma": "no-cache",
@@ -2126,11 +2611,20 @@ def create_app(model_id: str) -> FastAPI:
 
             cursor = 1
             sources: list[SearchResult] = []
-            if chat_request.agent_mode in {"web", "deep"}:
+            resolved_mode, search_decision = resolve_agent_mode(chat_request)
+            if chat_request.agent_mode == "auto":
+                set_fallback_step(job_id, steps, cursor, "active", "検索が必要か判定しています")
+                set_fallback_step(job_id, steps, cursor, "done", search_decision)
+                cursor += 1
+            if resolved_mode in {"web", "deep"}:
+                search_index = insert_search_steps(steps, resolved_mode)
+                if search_index:
+                    cursor = search_index
+                    set_fallback_job(job_id, steps=[step.model_dump() for step in steps])
                 set_fallback_step(job_id, steps, cursor, "active", "検索クエリを実行しています")
                 search_bundle = collect_sources(
                     chat_request.messages[-1].content,
-                    chat_request.agent_mode,
+                    resolved_mode,
                 )
                 sources = search_bundle.sources
                 detail = f"{len(sources)} 件の候補を取得"
@@ -2148,6 +2642,8 @@ def create_app(model_id: str) -> FastAPI:
 
             set_fallback_step(job_id, steps, cursor, "active", "会話履歴と条件をまとめています")
             enriched_request = request_with_sources(chat_request, sources)
+            if resolved_mode == "deep" and enriched_request.max_new_tokens is None:
+                enriched_request = enriched_request.model_copy(update={"max_new_tokens": 4096})
             set_fallback_step(job_id, steps, cursor, "done", "生成用プロンプトを作成")
             cursor += 1
 
@@ -2157,10 +2653,16 @@ def create_app(model_id: str) -> FastAPI:
             set_fallback_step(job_id, steps, cursor, "done", "生成が完了しました")
             cursor += 1
 
-            history = history_store.history(chat_request.user_id)
+            history = history_store.thread_history(chat_request.user_id, chat_request.thread_id)
             saved_messages = list(history.messages)
             saved_messages.append(ChatMessage(role="assistant", content=response.reply))
-            history_store.replace_history(chat_request.user_id, saved_messages)
+            history_store.replace_history(
+                chat_request.user_id,
+                saved_messages,
+                chat_request.thread_id,
+                last_mode=chat_request.agent_mode,
+                last_model_id=chat_request.model_id,
+            )
             set_fallback_step(job_id, steps, cursor, "done", "チャット画面へ回答を保存しました", done=True)
             set_fallback_job(job_id, mode="完了", detail="回答を表示しました", done=True)
             print(f"Fallback chat complete: job_id={job_id}, user={chat_request.user_id}", flush=True)
@@ -2173,10 +2675,10 @@ def create_app(model_id: str) -> FastAPI:
             steps[-1].status = "error"
             steps[-1].detail = str(exc)
             try:
-                history = history_store.history(chat_request.user_id)
+                history = history_store.thread_history(chat_request.user_id, chat_request.thread_id)
                 saved_messages = list(history.messages)
                 saved_messages.append(ChatMessage(role="assistant", content=f"エラー: {exc}"))
-                history_store.replace_history(chat_request.user_id, saved_messages)
+                history_store.replace_history(chat_request.user_id, saved_messages, chat_request.thread_id)
             finally:
                 set_fallback_job(
                     job_id,
@@ -2201,6 +2703,7 @@ def create_app(model_id: str) -> FastAPI:
         prompt = field("prompt")
         if not prompt:
             return RedirectResponse("/", status_code=303)
+        thread_id = field("thread_id", "default")
 
         model_id = field("model_id", engine.default_model_id)
         if model_id not in supported_model_specs():
@@ -2208,16 +2711,17 @@ def create_app(model_id: str) -> FastAPI:
         reasoning_effort = field("reasoning_effort", "medium")
         if reasoning_effort not in REASONING_PRESETS:
             reasoning_effort = "medium"
-        agent_mode = field("agent_mode", "chat")
-        if agent_mode not in AGENT_MODES:
-            agent_mode = "chat"
+        agent_mode = field("agent_mode", "auto" if AUTO_SEARCH_DEFAULT else "chat")
+        if agent_mode not in USER_AGENT_MODES:
+            agent_mode = "auto" if AUTO_SEARCH_DEFAULT else "chat"
 
-        history = history_store.history(user_id)
+        history = history_store.thread_history(user_id, thread_id)
         messages = list(history.messages)
         messages.append(ChatMessage(role="user", content=prompt))
-        history_store.replace_history(user_id, messages)
+        history_store.replace_history(user_id, messages, thread_id, last_mode=agent_mode, last_model_id=model_id)
         chat_request = ChatRequest(
             user_id=user_id,
+            thread_id=thread_id,
             model_id=model_id,
             messages=messages,
             reasoning_effort=reasoning_effort,  # type: ignore[arg-type]
@@ -2228,6 +2732,7 @@ def create_app(model_id: str) -> FastAPI:
         with fallback_lock:
             fallback_jobs[job_id] = {
                 "user_id": user_id,
+                "thread_id": thread_id,
                 "mode": AGENT_MODES[agent_mode]["label"],
                 "detail": "回答作成を開始しています",
                 "steps": [step.model_dump() for step in steps],
@@ -2237,7 +2742,7 @@ def create_app(model_id: str) -> FastAPI:
             }
         worker = threading.Thread(target=run_fallback_chat, args=(job_id, chat_request), daemon=True)
         worker.start()
-        return RedirectResponse(f"/?job_id={job_id}", status_code=303)
+        return RedirectResponse(f"/?thread_id={thread_id}&job_id={job_id}", status_code=303)
 
     @app.get("/api/health")
     def health() -> dict:
@@ -2245,7 +2750,9 @@ def create_app(model_id: str) -> FastAPI:
             "default_model_id": engine.default_model_id,
             "models": supported_model_specs(),
             "reasoning_presets": REASONING_PRESETS,
-            "agent_modes": AGENT_MODES,
+            "agent_modes": USER_AGENT_MODES,
+            "internal_agent_modes": AGENT_MODES,
+            "auto_search_default": AUTO_SEARCH_DEFAULT,
             "search_engine": SEARCH_ENGINE.lower(),
             "search_timeout_sec": SEARCH_TIMEOUT_SEC,
             "hpu_execution_mode": HPU_EXECUTION_MODE,
@@ -2283,14 +2790,41 @@ def create_app(model_id: str) -> FastAPI:
             "display_name": record.get("display_name", record["user_id"]),
         }
 
+    @app.get("/api/threads/{user_id}", response_model=list[ThreadSummary])
+    def user_threads(user_id: str) -> list[ThreadSummary]:
+        return history_store.list_threads(user_id)
+
+    @app.post("/api/threads", response_model=ThreadHistoryResponse)
+    def create_thread(request: ThreadRequest) -> ThreadHistoryResponse:
+        return history_store.create_thread(request.user_id, request.title)
+
+    @app.get("/api/threads/{user_id}/{thread_id}", response_model=ThreadHistoryResponse)
+    def thread_history(user_id: str, thread_id: str) -> ThreadHistoryResponse:
+        return history_store.thread_history(user_id, thread_id)
+
+    @app.patch("/api/threads/{user_id}/{thread_id}", response_model=ThreadHistoryResponse)
+    def update_thread(user_id: str, thread_id: str, request: ThreadUpdateRequest) -> ThreadHistoryResponse:
+        try:
+            return history_store.update_thread(user_id, thread_id, title=request.title, archived=request.archived)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.delete("/api/threads/{user_id}/{thread_id}")
+    def delete_thread(user_id: str, thread_id: str) -> dict:
+        try:
+            history_store.update_thread(user_id, thread_id, archived=True)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"deleted": True, "user_id": user_id, "thread_id": thread_id}
+
     @app.get("/api/history/{user_id}", response_model=HistoryResponse)
     def user_history(user_id: str) -> HistoryResponse:
         return history_store.history(user_id)
 
     @app.delete("/api/history/{user_id}")
-    def clear_user_history(user_id: str) -> dict:
-        history_store.clear_history(user_id)
-        return {"cleared": True, "user_id": user_id}
+    def clear_user_history(user_id: str, thread_id: str = "default") -> dict:
+        history_store.clear_history(user_id, thread_id)
+        return {"cleared": True, "user_id": user_id, "thread_id": thread_id}
 
     @app.post("/api/cancel/{request_id}")
     def cancel_request(request_id: str) -> dict:
@@ -2317,6 +2851,8 @@ def create_app(model_id: str) -> FastAPI:
         cancel_event.clear()
         steps = initial_steps(request.agent_mode)
         set_steps(request_id, steps)
+        resolved_mode = "chat"
+        search_decision = ""
         try:
             if engine.is_loaded and engine.active_model_id != request.model_id:
                 raise HTTPException(
@@ -2324,11 +2860,20 @@ def create_app(model_id: str) -> FastAPI:
                     detail="Select the model in the UI first. The server restarts to switch models cleanly.",
                 )
             cursor = 1
-            if request.agent_mode in {"web", "deep"}:
+            resolved_mode, search_decision = resolve_agent_mode(request)
+            if request.agent_mode == "auto":
+                update_step(request_id, steps, cursor, "active", "検索が必要か判定しています")
+                update_step(request_id, steps, cursor, "done", search_decision)
+                cursor += 1
+            if resolved_mode in {"web", "deep"}:
+                search_index = insert_search_steps(steps, resolved_mode)
+                if search_index:
+                    cursor = search_index
+                    set_steps(request_id, steps)
                 update_step(request_id, steps, cursor, "active", "検索クエリを実行しています")
                 search_bundle = collect_sources(
                     request.messages[-1].content,
-                    request.agent_mode,
+                    resolved_mode,
                     cancel_event=cancel_event,
                 )
                 sources = search_bundle.sources
@@ -2352,14 +2897,24 @@ def create_app(model_id: str) -> FastAPI:
             if cancel_event.is_set():
                 raise RequestCancelled()
             enriched_request = request_with_sources(request, sources)
+            if resolved_mode == "deep" and enriched_request.max_new_tokens is None:
+                enriched_request = enriched_request.model_copy(update={"max_new_tokens": 4096})
             update_step(request_id, steps, cursor, "done", "生成用プロンプトを作成")
             cursor += 1
             update_step(request_id, steps, cursor, "active", "HPU 上のモデルで生成しています")
             response = engine.generate(enriched_request, sources=sources, cancel_event=cancel_event)
             saved_messages = list(request.messages)
             saved_messages.append(ChatMessage(role="assistant", content=response.reply))
-            history_store.replace_history(request.user_id, saved_messages)
-            return response
+            history_store.replace_history(
+                request.user_id,
+                saved_messages,
+                request.thread_id,
+                last_mode=request.agent_mode,
+                last_model_id=request.model_id,
+            )
+            return response.model_copy(
+                update={"agent_mode": request.agent_mode, "resolved_mode": resolved_mode, "search_decision": search_decision}
+            )
         except HTTPException:
             update_step(request_id, steps, len(steps) - 1, "error", "リクエストを完了できませんでした", done=True)
             raise
@@ -2421,6 +2976,8 @@ def create_app(model_id: str) -> FastAPI:
         def stream_events():
             final_sent = False
             sources: list[SearchResult] = []
+            resolved_mode = "chat"
+            search_decision = ""
             try:
                 print(
                     f"Chat request start: request_id={request_id}, user={request.user_id}, "
@@ -2430,8 +2987,19 @@ def create_app(model_id: str) -> FastAPI:
                 yield status_event(f"{AGENT_MODES[request.agent_mode]['label']} を開始しています")
 
                 cursor = 1
-                if request.agent_mode in {"web", "deep"}:
-                    queries = search_queries(request.messages[-1].content, request.agent_mode)
+                resolved_mode, search_decision = resolve_agent_mode(request)
+                if request.agent_mode == "auto":
+                    update_step(request_id, steps, cursor, "active", "検索が必要か判定しています")
+                    yield status_event("検索要否を判定しています")
+                    update_step(request_id, steps, cursor, "done", search_decision)
+                    yield status_event(search_decision)
+                    cursor += 1
+                if resolved_mode in {"web", "deep"}:
+                    search_index = insert_search_steps(steps, resolved_mode)
+                    if search_index:
+                        cursor = search_index
+                        set_steps(request_id, steps)
+                    queries = search_queries(request.messages[-1].content, resolved_mode)
                     update_step(
                         request_id,
                         steps,
@@ -2440,13 +3008,13 @@ def create_app(model_id: str) -> FastAPI:
                         f"{len(queries)} 個の検索クエリを実行しています",
                     )
                     print(
-                        f"Search start: request_id={request_id}, mode={request.agent_mode}, queries={queries}",
+                        f"Search start: request_id={request_id}, mode={resolved_mode}, queries={queries}",
                         flush=True,
                     )
-                    yield status_event("Web検索中です")
+                    yield status_event("自動検索中です" if resolved_mode == "web" else "Deep search 中です")
                     search_bundle = collect_sources(
                         request.messages[-1].content,
-                        request.agent_mode,
+                        resolved_mode,
                         cancel_event=cancel_event,
                     )
                     sources = search_bundle.sources
@@ -2460,7 +3028,7 @@ def create_app(model_id: str) -> FastAPI:
                         f"warnings={len(search_bundle.warnings)}",
                         flush=True,
                     )
-                    yield status_event(f"Web検索完了: {detail}")
+                    yield status_event(f"検索完了: {detail}")
                     cursor += 1
 
                     update_step(request_id, steps, cursor, "active", "モデルへ渡す根拠を整えています")
@@ -2477,6 +3045,8 @@ def create_app(model_id: str) -> FastAPI:
                 if cancel_event.is_set():
                     raise RequestCancelled()
                 enriched_request = request_with_sources(request, sources)
+                if resolved_mode == "deep" and enriched_request.max_new_tokens is None:
+                    enriched_request = enriched_request.model_copy(update={"max_new_tokens": 4096})
                 update_step(request_id, steps, cursor, "done", "生成用プロンプトを作成")
                 cursor += 1
                 update_step(request_id, steps, cursor, "active", "HPU 上のモデルで生成しています")
@@ -2502,7 +3072,13 @@ def create_app(model_id: str) -> FastAPI:
                         response = ChatResponse(**event["data"])
                         saved_messages = list(request.messages)
                         saved_messages.append(ChatMessage(role="assistant", content=response.reply))
-                        history_store.replace_history(request.user_id, saved_messages)
+                        history_store.replace_history(
+                            request.user_id,
+                            saved_messages,
+                            request.thread_id,
+                            last_mode=request.agent_mode,
+                            last_model_id=request.model_id,
+                        )
                         steps[-2].status = "done"
                         steps[-2].detail = "生成が完了しました"
                         steps[-1].status = "done"
@@ -2511,9 +3087,17 @@ def create_app(model_id: str) -> FastAPI:
                         final_sent = True
                         print(
                             f"Chat request complete: request_id={request_id}, mode={request.agent_mode}, "
+                            f"resolved={resolved_mode}, "
                             f"tokens={response.generated_tokens}, elapsed={response.elapsed_sec:.2f}s",
                             flush=True,
                         )
+                        event["data"] = response.model_copy(
+                            update={
+                                "agent_mode": request.agent_mode,
+                                "resolved_mode": resolved_mode,
+                                "search_decision": search_decision,
+                            }
+                        ).model_dump()
                     yield line(event)
             except RequestCancelled:
                 for step in steps:
