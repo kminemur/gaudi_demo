@@ -190,7 +190,7 @@ HTML = """<!doctype html>
       min-height: 100vh;
       display: grid;
       grid-template-rows: auto 1fr auto;
-      max-width: 1080px;
+      max-width: 1280px;
       margin: 0 auto;
       padding: 18px;
       gap: 14px;
@@ -270,14 +270,24 @@ HTML = """<!doctype html>
       overflow-wrap: anywhere;
     }
 
+    .workspace {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr);
+      gap: 14px;
+    }
+
     .threadbar {
       display: grid;
-      grid-template-columns: 1fr auto auto auto;
+      grid-template-rows: auto auto 1fr;
       gap: 10px;
-      align-items: center;
-      padding: 10px 14px;
-      border-bottom: 1px solid var(--line);
-      background: #fff;
+      align-content: start;
+      min-height: 0;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
     }
 
     .thread-current {
@@ -295,18 +305,18 @@ HTML = """<!doctype html>
     }
 
     .thread-list {
-      grid-column: 1 / -1;
-      display: flex;
+      display: grid;
       gap: 8px;
-      overflow-x: auto;
-      padding-bottom: 2px;
+      overflow-y: auto;
+      min-height: 0;
     }
 
     .thread-item {
-      height: 34px;
-      flex: 0 0 auto;
+      min-height: 38px;
+      width: 100%;
       display: inline-grid;
-      place-items: center;
+      align-items: center;
+      justify-content: start;
       border: 1px solid var(--line);
       border-radius: 6px;
       background: #fbfbf9;
@@ -315,6 +325,7 @@ HTML = """<!doctype html>
       font-size: 13px;
       cursor: pointer;
       max-width: 220px;
+      text-align: left;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -378,12 +389,16 @@ HTML = """<!doctype html>
     }
 
     @media (max-width: 720px) {
+      .workspace {
+        grid-template-columns: 1fr;
+      }
+
       .activitybar {
         grid-template-columns: 1fr;
       }
 
       .threadbar {
-        grid-template-columns: 1fr;
+        max-height: 220px;
       }
 
       .activity-elapsed {
@@ -638,53 +653,54 @@ HTML = """<!doctype html>
       </form>
     </section>
 
-    <main id="chatView" class="hidden">
-      <div class="sessionbar">
-        <div class="session-user">ログイン中: <strong id="currentUserName"></strong></div>
-        <button id="clearHistory" class="secondary" type="button">履歴削除</button>
-        <a id="logout" class="secondary action-link" href="/logout">ログアウト</a>
-      </div>
-
-      <div class="threadbar">
+    <div id="chatView" class="workspace hidden">
+      <aside class="threadbar">
         <div class="thread-current">現在のスレッド<strong id="currentThreadTitle">メイン</strong></div>
         <a id="newThread" class="secondary action-link" href="/threads/new">新規スレッド</a>
-        <button id="renameThread" class="secondary" type="button">名前変更</button>
         <button id="deleteThread" class="secondary" type="button">削除</button>
         <div id="threadList" class="thread-list"></div>
-      </div>
+      </aside>
 
-      <div id="activityBar" class="activitybar ready">
-        <div id="activityMode" class="activity-mode">待機中</div>
-        <div id="activityDetail" class="activity-detail">メッセージを送信できます</div>
-        <div id="activityElapsed" class="activity-elapsed"></div>
-      </div>
+      <main>
+        <div class="sessionbar">
+          <div class="session-user">ログイン中: <strong id="currentUserName"></strong></div>
+          <button id="clearHistory" class="secondary" type="button">履歴削除</button>
+          <a id="logout" class="secondary action-link" href="/logout">ログアウト</a>
+        </div>
 
-      <div id="messages">
-        <div class="message system">選択した Qwen モデルが Intel Gaudi HPU 上で応答します。</div>
-      </div>
+        <div id="activityBar" class="activitybar ready">
+          <div id="activityMode" class="activity-mode">待機中</div>
+          <div id="activityDetail" class="activity-detail">メッセージを送信できます</div>
+          <div id="activityElapsed" class="activity-elapsed"></div>
+        </div>
 
-      <form id="chatForm" action="/chat/send" method="post">
-        <input id="threadId" name="thread_id" type="hidden" value="default" />
-        <select id="model" name="model_id" aria-label="model">
-          <option value="Qwen/Qwen3.6-27B" selected>Qwen3.6 27B</option>
-          <option value="Qwen/Qwen3.6-27B-FP8">Qwen3.6 27B FP8</option>
-          <option value="Qwen/Qwen3.6-35B-A3B-FP8">Qwen3.6 35B A3B FP8</option>
-          <option value="Qwen/Qwen3-32B">Qwen3 32B</option>
-        </select>
-        <select id="reasoning" name="reasoning_effort" aria-label="reasoning strength">
-          <option value="low">Low</option>
-          <option value="medium" selected>Medium</option>
-          <option value="high">High</option>
-        </select>
-        <select id="agentMode" name="agent_mode" aria-label="agent mode">
-          <option value="auto" selected>Auto</option>
-          <option value="chat">Chat</option>
-          <option value="deep">Deep search</option>
-        </select>
-        <textarea id="prompt" name="prompt" autocomplete="off" placeholder="メッセージを入力" autofocus></textarea>
-        <button id="send" type="submit">送信</button>
-      </form>
-    </main>
+        <div id="messages">
+          <div class="message system">選択した Qwen モデルが Intel Gaudi HPU 上で応答します。</div>
+        </div>
+
+        <form id="chatForm" action="/chat/send" method="post">
+          <input id="threadId" name="thread_id" type="hidden" value="default" />
+          <select id="model" name="model_id" aria-label="model">
+            <option value="Qwen/Qwen3.6-27B" selected>Qwen3.6 27B</option>
+            <option value="Qwen/Qwen3.6-27B-FP8">Qwen3.6 27B FP8</option>
+            <option value="Qwen/Qwen3.6-35B-A3B-FP8">Qwen3.6 35B A3B FP8</option>
+            <option value="Qwen/Qwen3-32B">Qwen3 32B</option>
+          </select>
+          <select id="reasoning" name="reasoning_effort" aria-label="reasoning strength">
+            <option value="low">Low</option>
+            <option value="medium" selected>Medium</option>
+            <option value="high">High</option>
+          </select>
+          <select id="agentMode" name="agent_mode" aria-label="agent mode">
+            <option value="auto" selected>Auto</option>
+            <option value="chat">Chat</option>
+            <option value="deep">Deep search</option>
+          </select>
+          <textarea id="prompt" name="prompt" autocomplete="off" placeholder="メッセージを入力" autofocus></textarea>
+          <button id="send" type="submit">送信</button>
+        </form>
+      </main>
+    </div>
   </div>
 
   <script>
@@ -704,7 +720,6 @@ HTML = """<!doctype html>
     const currentThreadTitleEl = document.querySelector("#currentThreadTitle");
     const threadListEl = document.querySelector("#threadList");
     const newThreadEl = document.querySelector("#newThread");
-    const renameThreadEl = document.querySelector("#renameThread");
     const deleteThreadEl = document.querySelector("#deleteThread");
     const threadIdEl = document.querySelector("#threadId");
     const clearHistoryEl = document.querySelector("#clearHistory");
@@ -824,8 +839,8 @@ HTML = """<!doctype html>
         const button = document.createElement("button");
         button.type = "button";
         button.className = `thread-item${thread.thread_id === currentThreadId ? " active" : ""}`;
-        button.textContent = `${thread.running ? "生成中 · " : ""}${thread.title || "新しいスレッド"}`;
-        button.title = `${thread.title || "新しいスレッド"} · ${thread.message_count || 0}件`;
+        button.textContent = `${thread.running ? "生成中 · " : ""}${thread.title || "無題"}`;
+        button.title = `${thread.title || "無題"} · ${thread.message_count || 0}件`;
         button.addEventListener("click", () => loadThread(thread.thread_id));
         threadListEl.appendChild(button);
       }
@@ -861,7 +876,7 @@ HTML = """<!doctype html>
       currentThreadId = data.thread_id;
       sessionStorage.setItem("gaudiChatThreadId", currentThreadId);
       threadIdEl.value = currentThreadId;
-      currentThreadTitleEl.textContent = data.title || "新しいスレッド";
+      currentThreadTitleEl.textContent = data.title || "無題";
       renderConversation(data.messages);
       await loadThreads();
       showChat();
@@ -877,24 +892,6 @@ HTML = """<!doctype html>
       if (!res.ok) throw new Error(data.detail || "スレッドを作成できませんでした");
       await loadThread(data.thread_id);
       finishActivity("新しいスレッドを作成しました");
-    }
-
-    async function renameCurrentThread() {
-      if (!currentUserId || !currentThreadId || isRunning) return;
-      const title = window.prompt("スレッド名", currentThreadTitleEl.textContent || "");
-      if (!title || !title.trim()) return;
-      const { res, data } = await fetchJson(
-        `/api/threads/${encodeURIComponent(currentUserId)}/${encodeURIComponent(currentThreadId)}`,
-        {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ title: title.trim() })
-        }
-      );
-      if (!res.ok) throw new Error(data.detail || "スレッド名を変更できませんでした");
-      currentThreadTitleEl.textContent = data.title || title.trim();
-      await loadThreads();
-      finishActivity("スレッド名を変更しました");
     }
 
     async function deleteCurrentThread() {
@@ -1241,14 +1238,6 @@ HTML = """<!doctype html>
       }
     });
 
-    renameThreadEl.addEventListener("click", async () => {
-      try {
-        await renameCurrentThread();
-      } catch (error) {
-        addMessage("system", `スレッド名を変更できませんでした: ${error.message}`);
-      }
-    });
-
     deleteThreadEl.addEventListener("click", async () => {
       try {
         await deleteCurrentThread();
@@ -1297,7 +1286,7 @@ def split_html_script() -> tuple[str, str]:
     start = HTML.index(script_open)
     end = HTML.index(script_close, start)
     script = HTML[start + len(script_open) : end].strip()
-    shell = HTML[:start] + '  <script src="/app.js?v=7" defer></script>\n' + HTML[end + len(script_close) :]
+    shell = HTML[:start] + '  <script src="/app.js?v=8" defer></script>\n' + HTML[end + len(script_close) :]
     return shell, script
 
 
@@ -1373,7 +1362,7 @@ def render_html(
             '<section id="loginView" class="login-view">',
             '<section id="loginView" class="login-view hidden">',
         )
-        shell = shell.replace('<main id="chatView" class="hidden">', '<main id="chatView">')
+        shell = shell.replace('<div id="chatView" class="workspace hidden">', '<div id="chatView" class="workspace">')
         shell = shell.replace(
             '<strong id="currentUserName"></strong>',
             f'<strong id="currentUserName">{safe_display_name}</strong>',
@@ -1574,7 +1563,7 @@ class HistoryStore:
             role = message.get("role", "") if isinstance(message, dict) else getattr(message, "role", "")
             if role == "user" and content:
                 return content.strip().replace("\n", " ")[:40] or "新しいスレッド"
-        return "新しいスレッド"
+        return "無題"
 
     def _ensure_threads_unlocked(self, record: dict) -> dict:
         threads = record.get("threads")
@@ -1794,7 +1783,7 @@ class HistoryStore:
             now = self._now()
             thread = threads[normalized_thread_id]
             thread["messages"] = serialized
-            if not thread.get("title") or thread.get("title") == "新しいスレッド":
+            if not thread.get("title") or thread.get("title") in {"新しいスレッド", "無題"}:
                 thread["title"] = self._thread_title(None, serialized)
             thread["updated_at"] = now
             if last_mode:
@@ -1845,7 +1834,7 @@ class HistoryStore:
                 messages = []
                 thread["messages"] = messages
             messages.append(message.model_dump())
-            if not thread.get("title") or thread.get("title") == "新しいスレッド":
+            if not thread.get("title") or thread.get("title") in {"新しいスレッド", "無題"}:
                 thread["title"] = self._thread_title(None, messages)
             now = self._now()
             thread["updated_at"] = now

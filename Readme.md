@@ -69,9 +69,10 @@ The agent mode selector is applied per message:
 DuckDuckGo is the default search engine. To temporarily switch back to Bing,
 start the server with `SEARCH_ENGINE=bing`.
 
-The chat screen supports multiple threads per user. Use the thread list to switch
-topics without mixing conversation history. The default `Auto` mode makes a
-per-message search decision inside the active thread.
+The chat screen supports multiple threads per user. Use the left-side thread
+list to switch topics without mixing conversation history. New thread titles are
+generated automatically from the first user message. The default `Auto` mode
+makes a per-message search decision inside the active thread.
 
 While a message is running, the UI shows agent steps such as web search,
 source preparation, prompt construction, model generation, and completion.
