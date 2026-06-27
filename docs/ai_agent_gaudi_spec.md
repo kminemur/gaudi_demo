@@ -455,7 +455,6 @@ model_id         : 使用モデル
 messages         : 会話履歴
 reasoning_effort : low / medium / high
 agent_mode       : auto / chat / deep
-resolved_mode    : 内部実行モード。auto 判定後に chat / web / deep のいずれか
 max_new_tokens   : 任意。1-4096
 temperature      : 0.0-2.0
 top_p            : 0.05-1.0

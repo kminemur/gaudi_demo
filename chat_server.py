@@ -272,7 +272,7 @@ HTML = """<!doctype html>
 
     .threadbar {
       display: grid;
-      grid-template-columns: 1fr auto;
+      grid-template-columns: 1fr auto auto auto;
       gap: 10px;
       align-items: center;
       padding: 10px 14px;
@@ -648,6 +648,8 @@ HTML = """<!doctype html>
       <div class="threadbar">
         <div class="thread-current">現在のスレッド<strong id="currentThreadTitle">メイン</strong></div>
         <button id="newThread" class="secondary" type="button">新規スレッド</button>
+        <button id="renameThread" class="secondary" type="button">名前変更</button>
+        <button id="deleteThread" class="secondary" type="button">削除</button>
         <div id="threadList" class="thread-list"></div>
       </div>
 
@@ -702,6 +704,8 @@ HTML = """<!doctype html>
     const currentThreadTitleEl = document.querySelector("#currentThreadTitle");
     const threadListEl = document.querySelector("#threadList");
     const newThreadEl = document.querySelector("#newThread");
+    const renameThreadEl = document.querySelector("#renameThread");
+    const deleteThreadEl = document.querySelector("#deleteThread");
     const threadIdEl = document.querySelector("#threadId");
     const clearHistoryEl = document.querySelector("#clearHistory");
     const logoutEl = document.querySelector("#logout");
@@ -819,7 +823,7 @@ HTML = """<!doctype html>
         const button = document.createElement("button");
         button.type = "button";
         button.className = `thread-item${thread.thread_id === currentThreadId ? " active" : ""}`;
-        button.textContent = thread.title || "新しいスレッド";
+        button.textContent = `${thread.running ? "生成中 · " : ""}${thread.title || "新しいスレッド"}`;
         button.title = `${thread.title || "新しいスレッド"} · ${thread.message_count || 0}件`;
         button.addEventListener("click", () => loadThread(thread.thread_id));
         threadListEl.appendChild(button);
@@ -861,6 +865,42 @@ HTML = """<!doctype html>
       if (!res.ok) throw new Error(data.detail || "スレッドを作成できませんでした");
       await loadThread(data.thread_id);
       finishActivity("新しいスレッドを作成しました");
+    }
+
+    async function renameCurrentThread() {
+      if (!currentUserId || !currentThreadId || isRunning) return;
+      const title = window.prompt("スレッド名", currentThreadTitleEl.textContent || "");
+      if (!title || !title.trim()) return;
+      const { res, data } = await fetchJson(
+        `/api/threads/${encodeURIComponent(currentUserId)}/${encodeURIComponent(currentThreadId)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: title.trim() })
+        }
+      );
+      if (!res.ok) throw new Error(data.detail || "スレッド名を変更できませんでした");
+      currentThreadTitleEl.textContent = data.title || title.trim();
+      await loadThreads();
+      finishActivity("スレッド名を変更しました");
+    }
+
+    async function deleteCurrentThread() {
+      if (!currentUserId || !currentThreadId || isRunning) return;
+      if (currentThreadId === "default") {
+        addMessage("system", "メインスレッドは削除できません。履歴削除を使ってください。");
+        return;
+      }
+      if (!window.confirm("このスレッドを削除しますか？")) return;
+      const { res, data } = await fetchJson(
+        `/api/threads/${encodeURIComponent(currentUserId)}/${encodeURIComponent(currentThreadId)}`,
+        { method: "DELETE" }
+      );
+      if (!res.ok) throw new Error(data.detail || "スレッドを削除できませんでした");
+      currentThreadId = "default";
+      sessionStorage.setItem("gaudiChatThreadId", currentThreadId);
+      await loadThread(currentThreadId);
+      finishActivity("スレッドを削除しました");
     }
 
     function showLogin() {
@@ -1224,6 +1264,22 @@ HTML = """<!doctype html>
       }
     });
 
+    renameThreadEl.addEventListener("click", async () => {
+      try {
+        await renameCurrentThread();
+      } catch (error) {
+        addMessage("system", `スレッド名を変更できませんでした: ${error.message}`);
+      }
+    });
+
+    deleteThreadEl.addEventListener("click", async () => {
+      try {
+        await deleteCurrentThread();
+      } catch (error) {
+        addMessage("system", `スレッドを削除できませんでした: ${error.message}`);
+      }
+    });
+
     logoutEl.addEventListener("click", async () => {
       if (isRunning) return;
       try {
@@ -1360,10 +1416,11 @@ def render_html(
             rendered_threads = []
             for thread in threads:
                 active_class = " active" if thread.thread_id == thread_id else ""
+                running_label = "生成中 · " if getattr(thread, "running", False) else ""
                 rendered_threads.append(
                     f'<a class="thread-item{active_class}" '
                     f'href="/?thread_id={html.escape(thread.thread_id, quote=True)}">'
-                    f'{html.escape(thread.title)}</a>'
+                    f'{html.escape(running_label + thread.title)}</a>'
                 )
             shell = shell.replace(
                 '<div id="threadList" class="thread-list"></div>',
@@ -2430,6 +2487,7 @@ def create_app(model_id: str) -> FastAPI:
     progress_lock = threading.Lock()
     agent_progress: dict[str, dict] = {}
     cancel_events: dict[str, threading.Event] = {}
+    progress_threads: dict[str, dict[str, str]] = {}
     fallback_lock = threading.Lock()
     fallback_jobs: dict[str, dict] = {}
 
@@ -2443,6 +2501,10 @@ def create_app(model_id: str) -> FastAPI:
                 "done": done,
                 "updated_at": time.time(),
             }
+
+    def set_progress_thread(request_id: str, user_id: str, thread_id: str) -> None:
+        with progress_lock:
+            progress_threads[request_id] = {"user_id": user_id, "thread_id": thread_id}
 
     def cancel_event_for(request_id: str) -> threading.Event:
         with progress_lock:
@@ -2792,7 +2854,21 @@ def create_app(model_id: str) -> FastAPI:
 
     @app.get("/api/threads/{user_id}", response_model=list[ThreadSummary])
     def user_threads(user_id: str) -> list[ThreadSummary]:
-        return history_store.list_threads(user_id)
+        summaries = history_store.list_threads(user_id)
+        running_threads = set()
+        with progress_lock:
+            for request_id, owner in progress_threads.items():
+                record = agent_progress.get(request_id)
+                if owner.get("user_id") == user_id and record and not record.get("done"):
+                    running_threads.add(owner.get("thread_id", "default"))
+        with fallback_lock:
+            for job in fallback_jobs.values():
+                if job.get("user_id") == user_id and not job.get("done"):
+                    running_threads.add(job.get("thread_id", "default"))
+        return [
+            summary.model_copy(update={"running": summary.thread_id in running_threads})
+            for summary in summaries
+        ]
 
     @app.post("/api/threads", response_model=ThreadHistoryResponse)
     def create_thread(request: ThreadRequest) -> ThreadHistoryResponse:
@@ -2849,6 +2925,7 @@ def create_app(model_id: str) -> FastAPI:
         request_id = request_key(request.request_id)
         cancel_event = cancel_event_for(request_id)
         cancel_event.clear()
+        set_progress_thread(request_id, request.user_id, request.thread_id)
         steps = initial_steps(request.agent_mode)
         set_steps(request_id, steps)
         resolved_mode = "chat"
@@ -2948,6 +3025,7 @@ def create_app(model_id: str) -> FastAPI:
         request_id = request_key(request.request_id)
         cancel_event = cancel_event_for(request_id)
         cancel_event.clear()
+        set_progress_thread(request_id, request.user_id, request.thread_id)
         steps = initial_steps(request.agent_mode)
         set_steps(request_id, steps)
         try:
