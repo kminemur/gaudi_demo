@@ -190,7 +190,7 @@ HTML = """<!doctype html>
       min-height: 100vh;
       display: grid;
       grid-template-rows: auto 1fr auto;
-      max-width: 1280px;
+      max-width: 1520px;
       margin: 0 auto;
       padding: 18px;
       gap: 14px;
@@ -273,7 +273,7 @@ HTML = """<!doctype html>
     .workspace {
       min-height: 0;
       display: grid;
-      grid-template-columns: 260px minmax(0, 1fr);
+      grid-template-columns: 240px minmax(0, 1fr);
       gap: 14px;
     }
 
@@ -453,7 +453,7 @@ HTML = """<!doctype html>
 
     #messages {
       flex: 1;
-      min-height: 420px;
+      min-height: min(68vh, 720px);
       overflow-y: auto;
       padding: 18px;
       display: flex;
@@ -547,16 +547,37 @@ HTML = """<!doctype html>
       border-top: 1px solid var(--line);
       padding: 14px;
       display: grid;
-      grid-template-columns: minmax(150px, 220px) minmax(120px, 150px) minmax(120px, 160px) 1fr auto;
+      grid-template-columns: minmax(220px, 300px) minmax(0, 1fr) auto;
       gap: 10px;
       align-items: end;
       background: #fbfbf9;
     }
 
+    .option-panel {
+      display: grid;
+      gap: 8px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+    }
+
+    .option-title {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .option-controls {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+
     textarea {
       width: 100%;
-      min-height: 52px;
-      max-height: 180px;
+      min-height: 76px;
+      max-height: 240px;
       resize: vertical;
       border: 1px solid var(--line);
       border-radius: 6px;
@@ -629,6 +650,7 @@ HTML = """<!doctype html>
       .sessionbar { grid-template-columns: 1fr; }
       #messages { min-height: 360px; padding: 12px; }
       #chatForm { grid-template-columns: 1fr; }
+      .option-controls { grid-template-columns: 1fr; }
       button, select { width: 100%; }
       .message { max-width: 100%; }
     }
@@ -680,22 +702,27 @@ HTML = """<!doctype html>
 
         <form id="chatForm" action="/chat/send" method="post">
           <input id="threadId" name="thread_id" type="hidden" value="default" />
-          <select id="model" name="model_id" aria-label="model">
-            <option value="Qwen/Qwen3.6-27B" selected>Qwen3.6 27B</option>
-            <option value="Qwen/Qwen3.6-27B-FP8">Qwen3.6 27B FP8</option>
-            <option value="Qwen/Qwen3.6-35B-A3B-FP8">Qwen3.6 35B A3B FP8</option>
-            <option value="Qwen/Qwen3-32B">Qwen3 32B</option>
-          </select>
-          <select id="reasoning" name="reasoning_effort" aria-label="reasoning strength">
-            <option value="low">Low</option>
-            <option value="medium" selected>Medium</option>
-            <option value="high">High</option>
-          </select>
-          <select id="agentMode" name="agent_mode" aria-label="agent mode">
-            <option value="auto" selected>Auto</option>
-            <option value="chat">Chat</option>
-            <option value="deep">Deep search</option>
-          </select>
+          <div class="option-panel">
+            <div class="option-title">オプション</div>
+            <div class="option-controls">
+              <select id="model" name="model_id" aria-label="model">
+                <option value="Qwen/Qwen3.6-27B" selected>Qwen3.6 27B</option>
+                <option value="Qwen/Qwen3.6-27B-FP8">Qwen3.6 27B FP8</option>
+                <option value="Qwen/Qwen3.6-35B-A3B-FP8">Qwen3.6 35B A3B FP8</option>
+                <option value="Qwen/Qwen3-32B">Qwen3 32B</option>
+              </select>
+              <select id="reasoning" name="reasoning_effort" aria-label="reasoning strength">
+                <option value="low">Low</option>
+                <option value="medium" selected>Medium</option>
+                <option value="high">High</option>
+              </select>
+              <select id="agentMode" name="agent_mode" aria-label="agent mode">
+                <option value="auto" selected>Auto</option>
+                <option value="chat">Chat</option>
+                <option value="deep">Deep search</option>
+              </select>
+            </div>
+          </div>
           <textarea id="prompt" name="prompt" autocomplete="off" placeholder="メッセージを入力" autofocus></textarea>
           <button id="send" type="submit">送信</button>
         </form>
@@ -1316,8 +1343,8 @@ def render_html(
         f'data-initial-thread-id="{safe_thread_id}">',
     )
     shell = re.sub(
-        r'        <select id="model" name="model_id" aria-label="model">.*?</select>',
-        f'        <select id="model" name="model_id" aria-label="model">\n{model_options}\n        </select>',
+        r'\s*<select id="model" name="model_id" aria-label="model">.*?</select>',
+        f'\n              <select id="model" name="model_id" aria-label="model">\n{model_options}\n              </select>',
         shell,
         flags=re.DOTALL,
     )
