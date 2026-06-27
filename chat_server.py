@@ -5,6 +5,7 @@ import html
 import importlib.metadata
 import json
 import os
+import queue
 import re
 import sys
 import threading
@@ -18,15 +19,17 @@ from typing import Literal
 from urllib.parse import quote_plus, unquote, urlparse, parse_qs
 
 # These must be set before importing torch / habana_frameworks. Lazy mode can be
-# faster for some LLMs, but this Qwen MoE FP8 checkpoint currently fails during
-# startup in lazy mode, so keep eager as the default and allow env overrides.
+# faster for some LLMs, but this model path currently starts more reliably in
+# eager mode. Weight sharing is also disabled by default to avoid quantized-model
+# memory warnings when FP8 checkpoints are not in use.
 os.environ.setdefault("PT_HPU_LAZY_MODE", "0")
+os.environ.setdefault("PT_HPU_WEIGHT_SHARING", "0")
 
 import torch
 import habana_frameworks.torch.core as htcore
 import requests
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from transformers import (
     AutoModelForCausalLM,
@@ -37,17 +40,47 @@ from transformers import (
     StoppingCriteriaList,
     TextIteratorStreamer,
 )
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 
-DEFAULT_MODEL_ID = "Qwen/Qwen3.6-27B"
+PREFERRED_DEFAULT_MODEL_ID = "Qwen/Qwen3.6-27B"
+COMPAT_DEFAULT_MODEL_ID = "Qwen/Qwen3-32B"
+
+
+def transformer_supports_model_type(model_type: str) -> bool:
+    return model_type in CONFIG_MAPPING
+
+
+DEFAULT_MODEL_ID = (
+    PREFERRED_DEFAULT_MODEL_ID
+    if transformer_supports_model_type("qwen3_5")
+    else COMPAT_DEFAULT_MODEL_ID
+)
+DEFAULT_SERVER_PORTS = {
+    "production": 8000,
+    "development": 8001,
+}
+
+
+def normalize_app_env(value: str | None) -> Literal["production", "development"]:
+    normalized = (value or "production").strip().lower()
+    if normalized in {"prod", "production"}:
+        return "production"
+    if normalized in {"dev", "development"}:
+        return "development"
+    raise ValueError("APP_ENV must be 'production' or 'development'")
+
+
+APP_ENV = normalize_app_env(os.environ.get("APP_ENV"))
 SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
+SERVER_PORT = int(os.environ.get("SERVER_PORT", DEFAULT_SERVER_PORTS[APP_ENV]))
 HISTORY_PATH = Path(os.environ.get("CHAT_HISTORY_PATH", "chat_history.json"))
 SEARCH_ENGINE = os.environ.get("SEARCH_ENGINE", "duckduckgo")
 SEARCH_TIMEOUT_SEC = float(os.environ.get("SEARCH_TIMEOUT_SEC", "8"))
 HPU_EXECUTION_MODE = "lazy" if os.environ.get("PT_HPU_LAZY_MODE") == "1" else "eager"
 USE_INT32_INPUTS = os.environ.get("USE_INT32_INPUTS", "1") == "1"
 MODEL_PLACEMENT = "single_hpu_transformers"
+OPTIMUM_HABANA_ENABLED: bool | None = None
 MODEL_SPECS = {
     "Qwen/Qwen3.6-27B-FP8": {
         "label": "Qwen3.6 27B FP8",
@@ -70,9 +103,23 @@ MODEL_SPECS = {
         "precision": "bf16",
     },
 }
+MODEL_REQUIRED_TYPES = {
+    "Qwen/Qwen3.6-27B-FP8": "qwen3_5",
+    "Qwen/Qwen3.6-35B-A3B-FP8": "qwen3_5",
+    "Qwen/Qwen3.6-27B": "qwen3_5",
+}
 FP8_CORRECTNESS_FALLBACKS = {
     "Qwen/Qwen3.6-27B-FP8": "Qwen/Qwen3.6-27B",
 }
+
+
+def is_model_supported(model_id: str) -> bool:
+    required_type = MODEL_REQUIRED_TYPES.get(model_id)
+    return required_type is None or transformer_supports_model_type(required_type)
+
+
+def supported_model_specs() -> dict[str, dict[str, str]]:
+    return {model_id: spec for model_id, spec in MODEL_SPECS.items() if is_model_supported(model_id)}
 
 
 def is_fp8_model(model_id: str) -> bool:
@@ -95,23 +142,26 @@ REASONING_PRESETS = {
     "low": {
         "label": "Low",
         "enable_thinking": False,
-        "max_new_tokens": 64,
+        "max_new_tokens": 128,
     },
     "medium": {
         "label": "Medium",
         "enable_thinking": False,
-        "max_new_tokens": 128,
+        "max_new_tokens": 512,
     },
     "high": {
         "label": "High",
         "enable_thinking": True,
-        "max_new_tokens": 512,
+        "max_new_tokens": 1024,
     },
 }
 AGENT_MODES = {
     "chat": {"label": "Chat", "description": "モデルだけで応答"},
     "web": {"label": "Web検索", "description": "Web検索結果を参照して応答"},
     "deep": {"label": "Deep search", "description": "複数検索で広めに調べて応答"},
+}
+AGENT_MODE_MIN_TOKENS = {
+    "deep": 4096,
 }
 
 
@@ -418,14 +468,27 @@ HTML = """<!doctype html>
 
     button.cancel:hover { background: #991b1b; }
 
-    button.secondary {
+    button.secondary,
+    a.secondary {
       color: var(--ink);
       background: #fff;
       border-color: var(--line);
     }
 
-    button.secondary:hover {
+    button.secondary:hover,
+    a.secondary:hover {
       background: #f2f3f0;
+    }
+
+    .action-link {
+      height: 44px;
+      display: inline-grid;
+      place-items: center;
+      padding: 0 16px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      text-decoration: none;
+      font-weight: 650;
     }
 
     select {
@@ -445,7 +508,7 @@ HTML = """<!doctype html>
     }
   </style>
 </head>
-<body>
+<body data-initial-user-id="" data-initial-display-name="">
   <div class="app">
     <header>
       <h1>Gaudi Qwen Chat</h1>
@@ -453,11 +516,11 @@ HTML = """<!doctype html>
     </header>
 
     <section id="loginView" class="login-view">
-      <form id="loginForm" class="login-panel">
+      <form id="loginForm" class="login-panel" action="/login" method="get">
         <div class="login-title">ログイン</div>
         <div class="field">
           <label for="loginName">ユーザー名</label>
-          <input id="loginName" autocomplete="username" placeholder="例: kazuki" autofocus />
+          <input id="loginName" name="display_name" autocomplete="username" placeholder="例: kazuki" autofocus />
         </div>
         <button id="loginButton" type="submit">ログイン</button>
         <div id="loginError" class="login-error"></div>
@@ -468,7 +531,7 @@ HTML = """<!doctype html>
       <div class="sessionbar">
         <div class="session-user">ログイン中: <strong id="currentUserName"></strong></div>
         <button id="clearHistory" class="secondary" type="button">履歴削除</button>
-        <button id="logout" class="secondary" type="button">ログアウト</button>
+        <a id="logout" class="secondary action-link" href="/logout">ログアウト</a>
       </div>
 
       <div id="messages">
@@ -517,13 +580,32 @@ HTML = """<!doctype html>
     const dotEl = document.querySelector("#dot");
     const statusText = document.querySelector("#statusText");
     const precisionText = document.querySelector("#precisionText");
-    const history = [];
+    const chatHistory = [];
     const defaultSystemMessage = "選択した Qwen モデルが Intel Gaudi HPU 上で応答します。";
     let activeRequestId = null;
     let activeController = null;
     let isRunning = false;
-    let currentUserId = sessionStorage.getItem("gaudiChatUserId") || "";
-    let currentDisplayName = sessionStorage.getItem("gaudiChatDisplayName") || "";
+    const initialUserId = document.body.dataset.initialUserId || "";
+    const initialDisplayName = document.body.dataset.initialDisplayName || "";
+    let currentUserId = sessionStorage.getItem("gaudiChatUserId") || initialUserId;
+    let currentDisplayName = sessionStorage.getItem("gaudiChatDisplayName") || initialDisplayName;
+    if (initialUserId && !sessionStorage.getItem("gaudiChatUserId")) {
+      sessionStorage.setItem("gaudiChatUserId", initialUserId);
+      sessionStorage.setItem("gaudiChatDisplayName", initialDisplayName || initialUserId);
+    }
+
+    async function fetchJson(url, options = {}, timeoutMs = 5000) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const requestOptions = Object.assign({}, options, { signal: options.signal || controller.signal });
+        const res = await fetch(url, requestOptions);
+        const data = await res.json();
+        return { res, data };
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
 
     async function cancelActiveRequest() {
       if (!activeRequestId) return;
@@ -531,7 +613,7 @@ HTML = """<!doctype html>
       setStatus("cancelling", "busy");
       try {
         await fetch(`/api/cancel/${encodeURIComponent(activeRequestId)}`, { method: "POST" });
-      } catch {}
+      } catch (_error) {}
       if (activeController) activeController.abort();
     }
 
@@ -550,12 +632,12 @@ HTML = """<!doctype html>
     }
 
     function renderConversation(messages) {
-      history.length = 0;
+      chatHistory.length = 0;
       messagesEl.innerHTML = "";
       addMessage("system", defaultSystemMessage);
       for (const message of messages || []) {
         if (message.role !== "user" && message.role !== "assistant") continue;
-        history.push({ role: message.role, content: message.content });
+        chatHistory.push({ role: message.role, content: message.content });
         addMessage(message.role, message.content);
       }
     }
@@ -575,27 +657,33 @@ HTML = """<!doctype html>
     }
 
     async function loadHistory(userId) {
-      const res = await fetch(`/api/history/${encodeURIComponent(userId)}`);
-      const data = await res.json();
+      const { res, data } = await fetchJson(`/api/history/${encodeURIComponent(userId)}`);
+      if (!res.ok) throw new Error(data.detail || "履歴を読み込めませんでした");
       renderConversation(data.messages);
       currentDisplayName = data.display_name;
       currentUserNameEl.textContent = currentDisplayName;
     }
 
     async function login(displayName) {
-      const res = await fetch("/api/users", {
+      const { res, data } = await fetchJson("/api/users", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ display_name: displayName })
       });
-      const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "ログインできませんでした");
       currentUserId = data.user_id;
       currentDisplayName = data.display_name;
       sessionStorage.setItem("gaudiChatUserId", currentUserId);
       sessionStorage.setItem("gaudiChatDisplayName", currentDisplayName);
-      await loadHistory(currentUserId);
+      renderConversation([]);
       showChat();
+      setStatus("ready", "ready");
+      try {
+        await loadHistory(currentUserId);
+        showChat();
+      } catch (error) {
+        addMessage("system", `履歴を読み込めませんでした: ${error.message}`);
+      }
     }
 
     function addMetrics(data) {
@@ -684,12 +772,11 @@ HTML = """<!doctype html>
 
     async function refreshHealth() {
       try {
-        const res = await fetch("/api/health");
-        const data = await res.json();
-        setStatus(data.model_loaded ? "ready" : "loading", data.model_loaded ? "ready" : "busy");
+        const { data } = await fetchJson("/api/health", {}, 3000);
+        setStatus("ready", "ready");
         precisionText.textContent = data.precision ? `· ${data.precision.toUpperCase()}` : "";
         syncModelOptions(data);
-      } catch {
+      } catch (_error) {
         setStatus("offline", "");
       }
     }
@@ -709,7 +796,7 @@ HTML = """<!doctype html>
       sendEl.classList.add("cancel");
       setStatus("generating", "busy");
       addMessage("user", prompt);
-      history.push({ role: "user", content: prompt });
+      chatHistory.push({ role: "user", content: prompt });
       const modeLabel = agentModeEl.options[agentModeEl.selectedIndex].textContent;
       const requestId = makeRequestId();
       activeRequestId = requestId;
@@ -723,29 +810,68 @@ HTML = """<!doctype html>
           const data = await res.json();
           renderSteps(stepsNode, data.steps);
           if (data.done) clearInterval(stepPoll);
-        } catch {}
+        } catch (_error) {}
       }, 750);
 
       try {
-        const res = await fetch("/api/chat", {
+        const res = await fetch("/api/chat/stream", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           signal: activeController.signal,
           body: JSON.stringify({
             request_id: requestId,
             user_id: currentUserId,
-            messages: history,
+            messages: chatHistory,
             model_id: modelEl.value,
             reasoning_effort: reasoningEl.value,
             agent_mode: agentModeEl.value
           })
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "request failed");
-        assistantNode.textContent = data.reply || "";
-        addMetrics(data);
-        addSources(data.sources);
-        history.push({ role: "assistant", content: data.reply || "" });
+        if (!res.ok) {
+          const data = await res.json();
+          throw new Error(data.detail || "request failed");
+        }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let streamedText = "";
+        let finalData = null;
+        let hasDelta = false;
+
+        const handleStreamEvent = (event) => {
+          if (event.type === "delta") {
+            if (!hasDelta) {
+              assistantNode.textContent = "";
+              hasDelta = true;
+            }
+            streamedText += event.text || "";
+            assistantNode.textContent = streamedText;
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+          } else if (event.type === "final") {
+            finalData = event.data;
+          } else if (event.type === "error") {
+            throw new Error(event.detail || "stream failed");
+          }
+        };
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+          for (const line of lines) {
+            if (line.trim()) handleStreamEvent(JSON.parse(line));
+          }
+        }
+        buffer += decoder.decode();
+        if (buffer.trim()) handleStreamEvent(JSON.parse(buffer));
+        if (!finalData) throw new Error("stream ended before final response");
+
+        assistantNode.textContent = finalData.reply || streamedText || "";
+        addMetrics(finalData);
+        addSources(finalData.sources);
+        chatHistory.push({ role: "assistant", content: finalData.reply || streamedText || "" });
         setStatus("ready", "ready");
       } catch (error) {
         if (error.name === "AbortError") {
@@ -763,7 +889,7 @@ HTML = """<!doctype html>
             const data = await res.json();
             renderSteps(stepsNode, data.steps);
           }
-        } catch {}
+        } catch (_error) {}
         sendEl.disabled = false;
         sendEl.textContent = "送信";
         sendEl.classList.remove("cancel");
@@ -782,18 +908,18 @@ HTML = """<!doctype html>
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model_id: modelEl.value })
-      }).catch(() => {});
+      }).catch((_error) => {});
       const selectedModel = modelEl.value;
       const waitForModel = setInterval(async () => {
         try {
           const res = await fetch("/api/health");
           const data = await res.json();
-          if (data.model_loaded && data.active_model_id === selectedModel) {
+          if (data.default_model_id === selectedModel && (!data.model_loaded || data.active_model_id === selectedModel)) {
             clearInterval(waitForModel);
             sendEl.disabled = false;
             setStatus("ready", "ready");
           }
-        } catch {}
+        } catch (_error) {}
       }, 3000);
     });
 
@@ -802,10 +928,16 @@ HTML = """<!doctype html>
       const displayName = loginNameEl.value.trim();
       if (!displayName) return;
       loginErrorEl.textContent = "";
+      const loginButton = document.querySelector("#loginButton");
+      loginButton.disabled = true;
+      setStatus("login", "busy");
       try {
         await login(displayName);
       } catch (error) {
         loginErrorEl.textContent = error.message;
+        setStatus("ready", "ready");
+      } finally {
+        loginButton.disabled = false;
       }
     });
 
@@ -817,6 +949,9 @@ HTML = """<!doctype html>
 
     logoutEl.addEventListener("click", async () => {
       if (isRunning) return;
+      try {
+        await fetch("/logout");
+      } catch (_error) {}
       sessionStorage.removeItem("gaudiChatUserId");
       sessionStorage.removeItem("gaudiChatDisplayName");
       currentUserId = "";
@@ -845,6 +980,42 @@ HTML = """<!doctype html>
 """
 
 
+def split_html_script() -> tuple[str, str]:
+    script_open = "  <script>"
+    script_close = "  </script>"
+    start = HTML.index(script_open)
+    end = HTML.index(script_close, start)
+    script = HTML[start + len(script_open) : end].strip()
+    shell = HTML[:start] + '  <script src="/app.js?v=6" defer></script>\n' + HTML[end + len(script_close) :]
+    return shell, script
+
+
+def render_html(user_id: str = "", display_name: str = "") -> str:
+    shell, _ = split_html_script()
+    safe_user_id = html.escape(user_id, quote=True)
+    safe_display_name = html.escape(display_name or user_id, quote=True)
+    shell = shell.replace(
+        '<body data-initial-user-id="" data-initial-display-name="">',
+        f'<body data-initial-user-id="{safe_user_id}" data-initial-display-name="{safe_display_name}">',
+    )
+    if user_id:
+        shell = shell.replace(
+            '<section id="loginView" class="login-view">',
+            '<section id="loginView" class="login-view hidden">',
+        )
+        shell = shell.replace('<main id="chatView" class="hidden">', '<main id="chatView">')
+        shell = shell.replace(
+            '<strong id="currentUserName"></strong>',
+            f'<strong id="currentUserName">{safe_display_name}</strong>',
+        )
+    return shell
+
+
+def app_javascript() -> str:
+    _, script = split_html_script()
+    return script + "\n"
+
+
 class ChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1)
@@ -857,7 +1028,7 @@ class ChatRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1)
     reasoning_effort: Literal["low", "medium", "high"] = "medium"
     agent_mode: Literal["chat", "web", "deep"] = "chat"
-    max_new_tokens: int | None = Field(default=None, ge=1, le=1024)
+    max_new_tokens: int | None = Field(default=None, ge=1, le=4096)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     top_p: float = Field(default=0.9, ge=0.05, le=1.0)
     enable_thinking: bool | None = None
@@ -1038,11 +1209,26 @@ class HistoryStore:
 
 
 class CancelStoppingCriteria(StoppingCriteria):
-    def __init__(self, cancel_event: threading.Event | None) -> None:
+    def __init__(self, cancel_event: threading.Event | None, prompt_len: int | None = None) -> None:
         self.cancel_event = cancel_event
+        self.prompt_len = prompt_len
+        self.start_time: float | None = None
+        self.first_token_time: float | None = None
+
+    def start(self) -> None:
+        self.start_time = time.perf_counter()
 
     def __call__(self, input_ids, scores, **kwargs) -> bool:
+        if self.prompt_len is not None and input_ids.shape[-1] > self.prompt_len:
+            if self.first_token_time is None:
+                self.first_token_time = time.perf_counter()
         return bool(self.cancel_event and self.cancel_event.is_set())
+
+    @property
+    def ttft(self) -> float | None:
+        if self.start_time is None or self.first_token_time is None:
+            return None
+        return self.first_token_time - self.start_time
 
 
 def normalize_duckduckgo_url(url: str) -> str:
@@ -1189,9 +1375,30 @@ def request_with_sources(request: ChatRequest, sources: list[SearchResult]) -> C
         f"{last.content}\n\n"
         f"{mode_name} の検索結果:\n{source_lines}\n\n"
         "上の検索結果を根拠として使い、必要なら [1] のように番号で出典を示して日本語で答えてください。"
+        "途中で切らず、長くなりそうな場合は要点を絞って最後まで完結させてください。"
     )
     messages[-1] = ChatMessage(role=last.role, content=enriched)
     return request.model_copy(update={"messages": messages})
+
+
+def enable_optimum_habana() -> bool:
+    global OPTIMUM_HABANA_ENABLED
+    if OPTIMUM_HABANA_ENABLED is not None:
+        return OPTIMUM_HABANA_ENABLED
+
+    python_bin_dir = os.path.dirname(sys.executable)
+    os.environ["PATH"] = f"{python_bin_dir}:{os.environ.get('PATH', '')}"
+    try:
+        from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
+    except Exception as error:
+        print(f"Optimum Habana unavailable: {error}", flush=True)
+        OPTIMUM_HABANA_ENABLED = False
+        return False
+
+    adapt_transformers_to_gaudi()
+    print("Optimum Habana Gaudi patches enabled.", flush=True)
+    OPTIMUM_HABANA_ENABLED = True
+    return True
 
 
 class ChatEngine:
@@ -1209,6 +1416,13 @@ class ChatEngine:
         model_id = model_id or self.default_model_id
         if model_id not in MODEL_SPECS:
             raise ValueError(f"Unsupported model: {model_id}")
+        if not is_model_supported(model_id):
+            required_type = MODEL_REQUIRED_TYPES[model_id]
+            raise ValueError(
+                f"{model_id} requires Transformers support for '{required_type}'. "
+                f"This environment provides transformers=={package_version('transformers')}; "
+                f"use {COMPAT_DEFAULT_MODEL_ID} or run with /home/test1/habanalabs-venv/bin/python."
+            )
         if self.is_loaded and self.active_model_id == model_id:
             return
 
@@ -1217,9 +1431,15 @@ class ChatEngine:
 
         self.unload()
         htcore.hpu_inference_set_env()
+        optimum_enabled = enable_optimum_habana()
         spec = MODEL_SPECS[model_id]
         execution_model_id = resolve_execution_model_id(model_id)
         started = time.time()
+        print(
+            f"Loading model: requested={model_id}, execution={execution_model_id}, "
+            f"kind={spec['kind']}, precision={spec['precision']}",
+            flush=True,
+        )
         if spec["kind"] == "image_text":
             tokenizer = AutoProcessor.from_pretrained(execution_model_id)
             model_cls = AutoModelForImageTextToText
@@ -1227,7 +1447,12 @@ class ChatEngine:
             tokenizer = AutoTokenizer.from_pretrained(execution_model_id)
             model_cls = AutoModelForCausalLM
 
-        model_kwargs = {} if is_fp8_model(execution_model_id) else {"dtype": torch.bfloat16}
+        if is_fp8_model(execution_model_id):
+            model_kwargs = {}
+        elif spec["kind"] == "image_text":
+            model_kwargs = {"dtype": torch.bfloat16}
+        else:
+            model_kwargs = {"torch_dtype": torch.bfloat16}
         self.model = model_cls.from_pretrained(
             execution_model_id,
             **model_kwargs,
@@ -1244,7 +1469,13 @@ class ChatEngine:
             f"bf16 fallback from {model_id}" if execution_model_id != model_id else spec["precision"]
         )
         self.loaded_at = time.time()
-        print(f"Loaded {model_id} on HPU in {self.loaded_at - started:.1f}s ({self.precision})", flush=True)
+        print(
+            f"Model load complete: requested={model_id}, active={self.active_model_id}, "
+            f"elapsed={self.loaded_at - started:.1f}s, precision={self.precision}",
+            flush=True,
+        )
+        if not optimum_enabled:
+            print("Continuing with Transformers + habana_frameworks fallback.", flush=True)
 
     def unload(self) -> None:
         if self.model is not None:
@@ -1314,64 +1545,44 @@ class ChatEngine:
                         inputs[key] = inputs[key].to(dtype=torch.int32)
             inputs = {key: value.to("hpu") for key, value in inputs.items()}
 
-            started = time.time()
+            prompt_len = inputs["input_ids"].shape[-1]
             do_sample = request.temperature > 0
-            streamer = TextIteratorStreamer(
-                self.tokenizer.tokenizer if hasattr(self.tokenizer, "tokenizer") else self.tokenizer,
-                skip_prompt=True,
-                skip_special_tokens=True,
-            )
-            generated_output = {}
-            generation_error = {}
+            stopping_criteria = CancelStoppingCriteria(cancel_event, prompt_len)
+            generation_kwargs = {
+                **inputs,
+                "max_new_tokens": self.max_new_tokens(request),
+                "do_sample": do_sample,
+                "pad_token_id": self.eos_token_id(),
+                "use_cache": True,
+                "stopping_criteria": StoppingCriteriaList([stopping_criteria]),
+            }
+            if do_sample:
+                generation_kwargs["temperature"] = request.temperature
+                generation_kwargs["top_p"] = request.top_p
 
-            def run_generate() -> None:
-                try:
-                    with torch.inference_mode():
-                        generated_output["output_ids"] = self.model.generate(
-                            **inputs,
-                            max_new_tokens=self.max_new_tokens(request),
-                            do_sample=do_sample,
-                            temperature=request.temperature if do_sample else None,
-                            top_p=request.top_p if do_sample else None,
-                            pad_token_id=self.eos_token_id(),
-                            use_cache=True,
-                            stopping_criteria=StoppingCriteriaList([CancelStoppingCriteria(cancel_event)]),
-                            streamer=streamer,
-                        )
-                        htcore.mark_step()
-                        torch.hpu.synchronize()
-                except Exception as exc:
-                    generation_error["error"] = exc
+            torch.hpu.synchronize()
+            started = time.perf_counter()
+            stopping_criteria.start()
+            with torch.inference_mode():
+                output_ids = self.model.generate(**generation_kwargs)
+                htcore.mark_step()
+                torch.hpu.synchronize()
 
-            first_token_at = None
-            chunks = []
-            worker = threading.Thread(target=run_generate)
-            worker.start()
-            for chunk in streamer:
-                if first_token_at is None:
-                    first_token_at = time.time()
-                chunks.append(chunk)
-            worker.join()
-
-            if generation_error:
-                raise generation_error["error"]
             if cancel_event and cancel_event.is_set():
                 raise RequestCancelled()
 
-            finished = time.time()
-            output_ids = generated_output["output_ids"]
-            prompt_len = inputs["input_ids"].shape[-1]
+            finished = time.perf_counter()
             generated_ids = output_ids[:, prompt_len:]
             generated_tokens = int(generated_ids.shape[-1])
-            reply = self.clean_reply("".join(chunks))
-            if not reply:
-                reply = self.clean_reply(self.decode(generated_ids))
+            reply = self.clean_reply(self.decode(generated_ids))
             if not reply:
                 reply = "High の推論でトークン上限に達しました。Medium に下げるか、上限を増やしてください。"
 
-            ttft_sec = (first_token_at or finished) - started
-            decode_sec = max(finished - (first_token_at or started), 1e-9)
-            tokens_per_sec = generated_tokens / decode_sec
+            elapsed_sec = finished - started
+            ttft_sec = stopping_criteria.ttft or elapsed_sec
+            decode_sec = max(elapsed_sec - (stopping_criteria.ttft or 0.0), 1e-9)
+            tps_tokens = max(generated_tokens - 1, 0) if stopping_criteria.ttft is not None else generated_tokens
+            tokens_per_sec = tps_tokens / decode_sec
             return ChatResponse(
                 reply=reply,
                 precision=self.precision,
@@ -1380,11 +1591,131 @@ class ChatEngine:
                 sources=sources,
                 effective_max_new_tokens=self.max_new_tokens(request),
                 enable_thinking=self.enable_thinking(request),
-                elapsed_sec=finished - started,
+                elapsed_sec=elapsed_sec,
                 ttft_sec=ttft_sec,
                 tokens_per_sec=tokens_per_sec,
                 generated_tokens=generated_tokens,
             )
+
+    def stream_generate(
+        self,
+        request: ChatRequest,
+        sources: list[SearchResult] | None = None,
+        cancel_event: threading.Event | None = None,
+    ):
+        sources = sources or []
+        with self.lock:
+            if cancel_event and cancel_event.is_set():
+                raise RequestCancelled()
+            self.load(request.model_id)
+            assert self.tokenizer is not None
+            assert self.model is not None
+            if cancel_event and cancel_event.is_set():
+                raise RequestCancelled()
+
+            text = self.render_prompt(request)
+            inputs = self.tokenize(text)
+            if USE_INT32_INPUTS:
+                for key in ("input_ids", "attention_mask"):
+                    if key in inputs:
+                        inputs[key] = inputs[key].to(dtype=torch.int32)
+            inputs = {key: value.to("hpu") for key, value in inputs.items()}
+
+            prompt_len = inputs["input_ids"].shape[-1]
+            do_sample = request.temperature > 0
+            stopping_criteria = CancelStoppingCriteria(cancel_event, prompt_len)
+            streamer = TextIteratorStreamer(
+                self.tokenizer.tokenizer if hasattr(self.tokenizer, "tokenizer") else self.tokenizer,
+                skip_prompt=True,
+                skip_special_tokens=True,
+                timeout=1.0,
+            )
+            generation_kwargs = {
+                **inputs,
+                "max_new_tokens": self.max_new_tokens(request),
+                "do_sample": do_sample,
+                "pad_token_id": self.eos_token_id(),
+                "use_cache": True,
+                "stopping_criteria": StoppingCriteriaList([stopping_criteria]),
+                "streamer": streamer,
+            }
+            if do_sample:
+                generation_kwargs["temperature"] = request.temperature
+                generation_kwargs["top_p"] = request.top_p
+
+            generated_output = {}
+            generation_error = {}
+
+            def run_generate() -> None:
+                try:
+                    with torch.inference_mode():
+                        generated_output["output_ids"] = self.model.generate(**generation_kwargs)
+                        htcore.mark_step()
+                        torch.hpu.synchronize()
+                except Exception as exc:
+                    generation_error["error"] = exc
+
+            torch.hpu.synchronize()
+            started = time.perf_counter()
+            stopping_criteria.start()
+            worker = threading.Thread(target=run_generate)
+            worker.start()
+
+            chunks = []
+            iterator = iter(streamer)
+            while True:
+                if cancel_event and cancel_event.is_set():
+                    worker.join(timeout=1.0)
+                    raise RequestCancelled()
+                try:
+                    chunk = next(iterator)
+                except StopIteration:
+                    break
+                except queue.Empty:
+                    if generation_error:
+                        raise generation_error["error"]
+                    if not worker.is_alive():
+                        break
+                    continue
+                if chunk:
+                    chunks.append(chunk)
+                    yield {"type": "delta", "text": chunk}
+
+            worker.join()
+            if generation_error:
+                raise generation_error["error"]
+            if cancel_event and cancel_event.is_set():
+                raise RequestCancelled()
+
+            finished = time.perf_counter()
+            output_ids = generated_output["output_ids"]
+            generated_ids = output_ids[:, prompt_len:]
+            generated_tokens = int(generated_ids.shape[-1])
+            reply = self.clean_reply("".join(chunks))
+            if not reply:
+                reply = self.clean_reply(self.decode(generated_ids))
+            if not reply:
+                reply = "High の推論でトークン上限に達しました。Medium に下げるか、上限を増やしてください。"
+
+            elapsed_sec = finished - started
+            ttft_sec = stopping_criteria.ttft or elapsed_sec
+            decode_sec = max(elapsed_sec - (stopping_criteria.ttft or 0.0), 1e-9)
+            tps_tokens = max(generated_tokens - 1, 0) if stopping_criteria.ttft is not None else generated_tokens
+            tokens_per_sec = tps_tokens / decode_sec
+            response = ChatResponse(
+                reply=reply,
+                precision=self.precision,
+                reasoning_effort=request.reasoning_effort,
+                agent_mode=request.agent_mode,
+                sources=sources,
+                effective_max_new_tokens=self.max_new_tokens(request),
+                enable_thinking=self.enable_thinking(request),
+                elapsed_sec=elapsed_sec,
+                ttft_sec=ttft_sec,
+                tokens_per_sec=tokens_per_sec,
+                generated_tokens=generated_tokens,
+            )
+            yield {"type": "final", "data": response.model_dump()}
 
     def eos_token_id(self) -> int | None:
         assert self.tokenizer is not None
@@ -1406,7 +1737,10 @@ class ChatEngine:
 
     def max_new_tokens(self, request: ChatRequest) -> int:
         preset_tokens = REASONING_PRESETS[request.reasoning_effort]["max_new_tokens"]
-        return request.max_new_tokens or int(preset_tokens)
+        if request.max_new_tokens is not None:
+            return request.max_new_tokens
+        mode_tokens = AGENT_MODE_MIN_TOKENS.get(request.agent_mode, 0)
+        return max(int(preset_tokens), mode_tokens)
 
     def enable_thinking(self, request: ChatRequest) -> bool:
         if request.enable_thinking is not None:
@@ -1476,21 +1810,60 @@ def create_app(model_id: str) -> FastAPI:
         print(f"habana-torch-plugin={package_version('habana-torch-plugin')}", flush=True)
         print(f"optimum-habana={package_version('optimum-habana')}", flush=True)
         print(f"transformers={package_version('transformers')}", flush=True)
-        print("fp8=pretrained when selecting Qwen/Qwen3.6-35B-A3B-FP8", flush=True)
-        engine.load(model_id)
+        print(f"default_model_id={engine.default_model_id}", flush=True)
         yield
 
     app = FastAPI(title="Gaudi Qwen Chat", lifespan=lifespan)
 
     @app.get("/", response_class=HTMLResponse)
-    def index() -> str:
-        return HTML
+    def index(request: Request) -> HTMLResponse:
+        user_id = request.cookies.get("gaudi_chat_user_id", "")
+        display_name = unquote(request.cookies.get("gaudi_chat_display_name", user_id))
+        return HTMLResponse(
+            render_html(user_id, display_name),
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+            },
+        )
+
+    @app.get("/app.js")
+    def app_js() -> Response:
+        return Response(
+            app_javascript(),
+            media_type="application/javascript; charset=utf-8",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+            },
+        )
+
+    @app.get("/login")
+    def login_fallback(display_name: str = "") -> RedirectResponse:
+        if not display_name.strip():
+            return RedirectResponse("/", status_code=303)
+        record = history_store.ensure_user(display_name=display_name)
+        response = RedirectResponse("/", status_code=303)
+        response.set_cookie("gaudi_chat_user_id", record["user_id"], samesite="lax")
+        response.set_cookie(
+            "gaudi_chat_display_name",
+            quote_plus(record.get("display_name", record["user_id"])),
+            samesite="lax",
+        )
+        return response
+
+    @app.get("/logout")
+    def logout_fallback() -> RedirectResponse:
+        response = RedirectResponse("/", status_code=303)
+        response.delete_cookie("gaudi_chat_user_id")
+        response.delete_cookie("gaudi_chat_display_name")
+        return response
 
     @app.get("/api/health")
     def health() -> dict:
         return {
             "default_model_id": engine.default_model_id,
-            "models": MODEL_SPECS,
+            "models": supported_model_specs(),
             "reasoning_presets": REASONING_PRESETS,
             "agent_modes": AGENT_MODES,
             "search_engine": SEARCH_ENGINE.lower(),
@@ -1502,9 +1875,9 @@ def create_app(model_id: str) -> FastAPI:
             "model_loaded": engine.is_loaded,
             "precision": engine.precision,
             "fp8_enabled": engine.precision.startswith("fp8"),
-            "hpu_available": torch.hpu.is_available(),
-            "hpu_devices": torch.hpu.device_count() if torch.hpu.is_available() else 0,
-            "hpu_current_device": torch.hpu.current_device() if torch.hpu.is_available() else None,
+            "hpu_available": None,
+            "hpu_devices": None,
+            "hpu_current_device": None,
             "loaded_at": engine.loaded_at,
         }
 
@@ -1517,8 +1890,14 @@ def create_app(model_id: str) -> FastAPI:
         return {"steps": record["steps"], "done": record["done"], "updated_at": record["updated_at"]}
 
     @app.post("/api/users")
-    def save_user(request: UserRequest) -> dict:
+    def save_user(request: UserRequest, response: Response) -> dict:
         record = history_store.ensure_user(request.user_id, request.display_name)
+        response.set_cookie("gaudi_chat_user_id", record["user_id"], samesite="lax")
+        response.set_cookie(
+            "gaudi_chat_display_name",
+            quote_plus(record.get("display_name", record["user_id"])),
+            samesite="lax",
+        )
         return {
             "user_id": record["user_id"],
             "display_name": record.get("display_name", record["user_id"]),
@@ -1629,21 +2008,139 @@ def create_app(model_id: str) -> FastAPI:
                 steps[-1].detail = "ブラウザへ応答を返しました"
                 set_steps(request_id, steps, done=True)
 
+    @app.post("/api/chat/stream")
+    def chat_stream(request: ChatRequest) -> StreamingResponse:
+        request_id = request_key(request.request_id)
+        cancel_event = cancel_event_for(request_id)
+        cancel_event.clear()
+        steps = initial_steps(request.agent_mode)
+        set_steps(request_id, steps)
+        try:
+            if engine.is_loaded and engine.active_model_id != request.model_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Select the model in the UI first. The server restarts to switch models cleanly.",
+                )
+            cursor = 1
+            if request.agent_mode in {"web", "deep"}:
+                update_step(request_id, steps, cursor, "active", "検索クエリを実行しています")
+                search_bundle = collect_sources(
+                    request.messages[-1].content,
+                    request.agent_mode,
+                    cancel_event=cancel_event,
+                )
+                sources = search_bundle.sources
+                if search_bundle.warnings:
+                    detail = f"{len(sources)} 件取得。一部検索失敗: {len(search_bundle.warnings)} 件"
+                else:
+                    detail = f"{len(sources)} 件の候補を取得"
+                update_step(request_id, steps, cursor, "done", detail)
+                cursor += 1
+                update_step(request_id, steps, cursor, "active", "モデルへ渡す根拠を整えています")
+                if cancel_event.is_set():
+                    raise RequestCancelled()
+                if sources:
+                    update_step(request_id, steps, cursor, "done", f"{min(len(sources), 8)} 件をコンテキスト化")
+                else:
+                    update_step(request_id, steps, cursor, "done", "検索結果なし。通常プロンプトで続行")
+                cursor += 1
+            else:
+                sources = []
+            update_step(request_id, steps, cursor, "active", "会話履歴とエージェント結果を結合しています")
+            if cancel_event.is_set():
+                raise RequestCancelled()
+            enriched_request = request_with_sources(request, sources)
+            update_step(request_id, steps, cursor, "done", "生成用プロンプトを作成")
+            cursor += 1
+            update_step(request_id, steps, cursor, "active", "HPU 上のモデルで生成しています")
+        except HTTPException:
+            update_step(request_id, steps, len(steps) - 1, "error", "リクエストを完了できませんでした", done=True)
+            raise
+        except RequestCancelled as exc:
+            for step in steps:
+                if step.status == "active":
+                    step.status = "error"
+                    step.detail = "キャンセルされました"
+            steps[-1].status = "error"
+            steps[-1].detail = "ユーザーがリクエストをキャンセルしました"
+            set_steps(request_id, steps, done=True)
+            raise HTTPException(status_code=499, detail="Request cancelled") from exc
+        except requests.RequestException as exc:
+            update_step(request_id, steps, len(steps) - 1, "error", f"Web検索に失敗しました: {exc}", done=True)
+            raise HTTPException(status_code=502, detail=f"Web search failed: {exc}") from exc
+        except Exception as exc:
+            update_step(request_id, steps, len(steps) - 1, "error", str(exc), done=True)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        def line(event: dict) -> str:
+            return json.dumps(event, ensure_ascii=False) + "\n"
+
+        def stream_events():
+            final_sent = False
+            try:
+                for event in engine.stream_generate(enriched_request, sources=sources, cancel_event=cancel_event):
+                    if event["type"] == "final":
+                        response = ChatResponse(**event["data"])
+                        saved_messages = list(request.messages)
+                        saved_messages.append(ChatMessage(role="assistant", content=response.reply))
+                        history_store.replace_history(request.user_id, saved_messages)
+                        steps[-2].status = "done"
+                        steps[-2].detail = "生成が完了しました"
+                        steps[-1].status = "done"
+                        steps[-1].detail = "ブラウザへ応答を返しました"
+                        set_steps(request_id, steps, done=True)
+                        final_sent = True
+                    yield line(event)
+            except RequestCancelled:
+                for step in steps:
+                    if step.status == "active":
+                        step.status = "error"
+                        step.detail = "キャンセルされました"
+                steps[-1].status = "error"
+                steps[-1].detail = "ユーザーがリクエストをキャンセルしました"
+                set_steps(request_id, steps, done=True)
+                yield line({"type": "error", "detail": "Request cancelled"})
+            except Exception as exc:
+                update_step(request_id, steps, len(steps) - 1, "error", str(exc), done=True)
+                yield line({"type": "error", "detail": str(exc)})
+            finally:
+                with progress_lock:
+                    record = agent_progress.get(request_id)
+                if record and not record["done"] and not final_sent:
+                    update_step(request_id, steps, len(steps) - 1, "error", "ストリームが中断されました", done=True)
+
+        return StreamingResponse(stream_events(), media_type="application/x-ndjson")
+
     @app.post("/api/switch_model")
     def switch_model(request: SwitchModelRequest) -> dict:
-        if request.model_id not in MODEL_SPECS:
+        if request.model_id not in supported_model_specs():
             raise HTTPException(status_code=400, detail=f"Unsupported model: {request.model_id}")
+        if not engine.is_loaded:
+            engine.default_model_id = request.model_id
+            return {
+                "restarting": False,
+                "active_model_id": None,
+                "default_model_id": engine.default_model_id,
+            }
         if engine.is_loaded and engine.active_model_id == request.model_id:
-            return {"restarting": False, "active_model_id": engine.active_model_id}
+            engine.default_model_id = request.model_id
+            return {
+                "restarting": False,
+                "active_model_id": engine.active_model_id,
+                "default_model_id": engine.default_model_id,
+            }
 
         def restart() -> None:
             env = os.environ.copy()
             env["MODEL_ID"] = request.model_id
+            env["APP_ENV"] = APP_ENV
             env["SERVER_HOST"] = SERVER_HOST
             env["SERVER_PORT"] = str(SERVER_PORT)
             args = [
                 sys.executable,
                 os.path.abspath(__file__),
+                "--env",
+                APP_ENV,
                 "--host",
                 SERVER_HOST,
                 "--port",
@@ -1661,10 +2158,18 @@ def create_app(model_id: str) -> FastAPI:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve a web chat UI for Qwen on Gaudi.")
-    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, choices=sorted(MODEL_SPECS))
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
-    return parser.parse_args()
+    parser.add_argument("--model-id", default=os.environ.get("MODEL_ID", DEFAULT_MODEL_ID), choices=sorted(supported_model_specs()))
+    parser.add_argument(
+        "--env",
+        choices=("production", "development", "prod", "dev"),
+        default=os.environ.get("APP_ENV", "production"),
+    )
+    parser.add_argument("--host", default=os.environ.get("SERVER_HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=None)
+    args = parser.parse_args()
+    args.env = normalize_app_env(args.env)
+    args.port = args.port or int(os.environ.get("SERVER_PORT", DEFAULT_SERVER_PORTS[args.env]))
+    return args
 
 
 app = create_app(os.environ.get("MODEL_ID", DEFAULT_MODEL_ID))
@@ -1674,6 +2179,7 @@ if __name__ == "__main__":
     import uvicorn
 
     args = parse_args()
+    APP_ENV = args.env
     SERVER_HOST = args.host
     SERVER_PORT = args.port
     app = create_app(args.model_id)
