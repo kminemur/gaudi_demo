@@ -5,28 +5,17 @@ Run Qwen models on Intel Gaudi HPU. The chat server defaults to
 
 ## Chat UI
 
-Start a production web chat server bound to all interfaces. Production uses port
-`8000` by default:
+Start a web chat server bound to all interfaces. The server uses port `8000` by
+default:
 
 ```bash
 HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python chat_server.py \
-  --env production \
   --host 0.0.0.0
 ```
 
 Then open `http://<server-ip>:8000/`.
 
-For development, use the separate development port `8001`:
-
-```bash
-HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python chat_server.py \
-  --env development \
-  --host 0.0.0.0
-```
-
-Then open `http://<server-ip>:8001/`.
-
-You can still override either default with `SERVER_PORT` or `--port`.
+You can override the default with `SERVER_PORT` or `--port`.
 
 To keep the server running in the background after closing the terminal, start it
 with `nohup`:
@@ -35,7 +24,6 @@ with `nohup`:
 cd /home/test1/kazuki/gaudi_demo
 
 HF_HOME=$PWD/hf_cache nohup /home/test1/habanalabs-venv/bin/python chat_server.py \
-  --env production \
   --host 0.0.0.0 \
   > chat_server.log 2>&1 &
 ```
@@ -49,7 +37,7 @@ tail -f chat_server.log
 Stop the background server:
 
 ```bash
-pkill -f "chat_server.py --env production"
+pkill -f "chat_server.py --host 0.0.0.0"
 ```
 
 The first screen asks for a user name. Each user gets a separate chat screen and
@@ -102,7 +90,6 @@ single-HPU Transformers execution path.
 
 ```bash
 HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python chat_server.py \
-  --env production \
   --host 0.0.0.0 \
   --model-id Qwen/Qwen3.6-27B
 ```

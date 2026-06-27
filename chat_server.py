@@ -56,24 +56,9 @@ DEFAULT_MODEL_ID = (
     if transformer_supports_model_type("qwen3_5")
     else COMPAT_DEFAULT_MODEL_ID
 )
-DEFAULT_SERVER_PORTS = {
-    "production": 8000,
-    "development": 8001,
-}
-
-
-def normalize_app_env(value: str | None) -> Literal["production", "development"]:
-    normalized = (value or "production").strip().lower()
-    if normalized in {"prod", "production"}:
-        return "production"
-    if normalized in {"dev", "development"}:
-        return "development"
-    raise ValueError("APP_ENV must be 'production' or 'development'")
-
-
-APP_ENV = normalize_app_env(os.environ.get("APP_ENV"))
+DEFAULT_SERVER_PORT = 8000
 SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", DEFAULT_SERVER_PORTS[APP_ENV]))
+SERVER_PORT = int(os.environ.get("SERVER_PORT", DEFAULT_SERVER_PORT))
 HISTORY_PATH = Path(os.environ.get("CHAT_HISTORY_PATH", "chat_history.json"))
 SEARCH_ENGINE = os.environ.get("SEARCH_ENGINE", "duckduckgo")
 SEARCH_TIMEOUT_SEC = float(os.environ.get("SEARCH_TIMEOUT_SEC", "8"))
@@ -278,6 +263,66 @@ HTML = """<!doctype html>
       color: var(--muted);
       font-size: 13px;
       overflow-wrap: anywhere;
+    }
+
+    .activitybar {
+      display: grid;
+      grid-template-columns: minmax(110px, auto) 1fr auto;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--line);
+      background: #f7faf9;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .activity-mode {
+      color: var(--ink);
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .activity-detail {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .activity-elapsed {
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    .activitybar.busy .activity-mode::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      display: inline-block;
+      margin-right: 7px;
+      border-radius: 999px;
+      background: #f59e0b;
+      vertical-align: 1px;
+    }
+
+    .activitybar.ready .activity-mode::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      display: inline-block;
+      margin-right: 7px;
+      border-radius: 999px;
+      background: #16a34a;
+      vertical-align: 1px;
+    }
+
+    @media (max-width: 720px) {
+      .activitybar {
+        grid-template-columns: 1fr;
+      }
+
+      .activity-elapsed {
+        white-space: normal;
+      }
     }
 
     .field {
@@ -534,28 +579,34 @@ HTML = """<!doctype html>
         <a id="logout" class="secondary action-link" href="/logout">ログアウト</a>
       </div>
 
+      <div id="activityBar" class="activitybar ready">
+        <div id="activityMode" class="activity-mode">待機中</div>
+        <div id="activityDetail" class="activity-detail">メッセージを送信できます</div>
+        <div id="activityElapsed" class="activity-elapsed"></div>
+      </div>
+
       <div id="messages">
         <div class="message system">選択した Qwen モデルが Intel Gaudi HPU 上で応答します。</div>
       </div>
 
-      <form id="chatForm">
-        <select id="model" aria-label="model">
+      <form id="chatForm" action="/chat/send" method="post">
+        <select id="model" name="model_id" aria-label="model">
           <option value="Qwen/Qwen3.6-27B" selected>Qwen3.6 27B</option>
           <option value="Qwen/Qwen3.6-27B-FP8">Qwen3.6 27B FP8</option>
           <option value="Qwen/Qwen3.6-35B-A3B-FP8">Qwen3.6 35B A3B FP8</option>
           <option value="Qwen/Qwen3-32B">Qwen3 32B</option>
         </select>
-        <select id="reasoning" aria-label="reasoning strength">
+        <select id="reasoning" name="reasoning_effort" aria-label="reasoning strength">
           <option value="low">Low</option>
           <option value="medium" selected>Medium</option>
           <option value="high">High</option>
         </select>
-        <select id="agentMode" aria-label="agent mode">
+        <select id="agentMode" name="agent_mode" aria-label="agent mode">
           <option value="chat" selected>Chat</option>
           <option value="web">Web検索</option>
           <option value="deep">Deep search</option>
         </select>
-        <textarea id="prompt" autocomplete="off" placeholder="メッセージを入力" autofocus></textarea>
+        <textarea id="prompt" name="prompt" autocomplete="off" placeholder="メッセージを入力" autofocus></textarea>
         <button id="send" type="submit">送信</button>
       </form>
     </main>
@@ -580,11 +631,17 @@ HTML = """<!doctype html>
     const dotEl = document.querySelector("#dot");
     const statusText = document.querySelector("#statusText");
     const precisionText = document.querySelector("#precisionText");
+    const activityBarEl = document.querySelector("#activityBar");
+    const activityModeEl = document.querySelector("#activityMode");
+    const activityDetailEl = document.querySelector("#activityDetail");
+    const activityElapsedEl = document.querySelector("#activityElapsed");
     const chatHistory = [];
     const defaultSystemMessage = "選択した Qwen モデルが Intel Gaudi HPU 上で応答します。";
     let activeRequestId = null;
     let activeController = null;
     let isRunning = false;
+    let activityStartedAt = null;
+    let activityTimer = null;
     const initialUserId = document.body.dataset.initialUserId || "";
     const initialDisplayName = document.body.dataset.initialDisplayName || "";
     let currentUserId = sessionStorage.getItem("gaudiChatUserId") || initialUserId;
@@ -620,6 +677,41 @@ HTML = """<!doctype html>
     function setStatus(text, state) {
       statusText.textContent = text;
       dotEl.className = `dot ${state || ""}`;
+    }
+
+    function updateActivity(mode, detail, state) {
+      activityModeEl.textContent = mode || "待機中";
+      activityDetailEl.textContent = detail || "";
+      activityBarEl.className = `activitybar ${state || "ready"}`;
+    }
+
+    function startActivity(mode, detail) {
+      activityStartedAt = Date.now();
+      updateActivity(mode, detail, "busy");
+      if (activityTimer) clearInterval(activityTimer);
+      activityTimer = setInterval(() => {
+        if (!activityStartedAt) return;
+        const elapsed = Math.floor((Date.now() - activityStartedAt) / 1000);
+        activityElapsedEl.textContent = `${elapsed}s`;
+      }, 1000);
+      activityElapsedEl.textContent = "0s";
+    }
+
+    function finishActivity(detail) {
+      if (activityTimer) clearInterval(activityTimer);
+      activityTimer = null;
+      activityStartedAt = null;
+      activityElapsedEl.textContent = "";
+      updateActivity("待機中", detail || "メッセージを送信できます", "ready");
+    }
+
+    function activeStepSummary(steps) {
+      if (!steps || steps.length === 0) return "";
+      const active = steps.find((step) => step.status === "active");
+      if (active) return active.detail ? `${active.label}: ${active.detail}` : active.label;
+      const lastDone = [...steps].reverse().find((step) => step.status === "done");
+      if (lastDone) return lastDone.detail ? `${lastDone.label}: ${lastDone.detail}` : lastDone.label;
+      return "";
     }
 
     function addMessage(role, text) {
@@ -678,6 +770,7 @@ HTML = """<!doctype html>
       renderConversation([]);
       showChat();
       setStatus("ready", "ready");
+      finishActivity("ログインしました");
       try {
         await loadHistory(currentUserId);
         showChat();
@@ -710,6 +803,18 @@ HTML = """<!doctype html>
       messagesEl.appendChild(node);
       messagesEl.scrollTop = messagesEl.scrollHeight;
       return node;
+    }
+
+    function clientInitialSteps(mode) {
+      const steps = [{ label: "リクエスト受付", status: "done", detail: mode.toUpperCase() }];
+      if (mode === "web" || mode === "deep") {
+        steps.push({ label: "Web検索", status: "active", detail: "検索開始を待っています" });
+        steps.push({ label: "検索結果の整理", status: "pending", detail: "" });
+      }
+      steps.push({ label: "プロンプト作成", status: "pending", detail: "" });
+      steps.push({ label: "モデル生成", status: "pending", detail: "" });
+      steps.push({ label: "応答完了", status: "pending", detail: "" });
+      return steps;
     }
 
     function renderSteps(node, steps) {
@@ -795,20 +900,25 @@ HTML = """<!doctype html>
       sendEl.textContent = "キャンセル";
       sendEl.classList.add("cancel");
       setStatus("generating", "busy");
+      const modeLabel = agentModeEl.options[agentModeEl.selectedIndex].textContent;
+      startActivity(modeLabel, "リクエストを送信しています");
       addMessage("user", prompt);
       chatHistory.push({ role: "user", content: prompt });
-      const modeLabel = agentModeEl.options[agentModeEl.selectedIndex].textContent;
       const requestId = makeRequestId();
       activeRequestId = requestId;
       activeController = new AbortController();
       const assistantNode = addMessage("assistant", agentModeEl.value === "chat" ? "生成中..." : `${modeLabel} 中...`);
       const stepsNode = addStepPanel();
+      renderSteps(stepsNode, clientInitialSteps(agentModeEl.value));
+      addMessage("system", `mode=${agentModeEl.value} / request=${requestId}`);
       const stepPoll = setInterval(async () => {
         try {
           const res = await fetch(`/api/agent_steps/${encodeURIComponent(requestId)}`);
           if (!res.ok) return;
           const data = await res.json();
           renderSteps(stepsNode, data.steps);
+          const summary = activeStepSummary(data.steps);
+          if (summary) updateActivity(modeLabel, summary, data.done ? "ready" : "busy");
           if (data.done) clearInterval(stepPoll);
         } catch (_error) {}
       }, 750);
@@ -851,6 +961,15 @@ HTML = """<!doctype html>
             finalData = event.data;
           } else if (event.type === "error") {
             throw new Error(event.detail || "stream failed");
+          } else if (event.type === "status") {
+            if (event.message && !hasDelta) assistantNode.textContent = event.message;
+            if (event.steps) renderSteps(stepsNode, event.steps);
+            if (event.message) updateActivity(modeLabel, event.message, "busy");
+            if (event.steps) {
+              const summary = activeStepSummary(event.steps);
+              if (summary) updateActivity(modeLabel, summary, "busy");
+            }
+            if (event.status) setStatus(event.status, "busy");
           }
         };
 
@@ -873,13 +992,16 @@ HTML = """<!doctype html>
         addSources(finalData.sources);
         chatHistory.push({ role: "assistant", content: finalData.reply || streamedText || "" });
         setStatus("ready", "ready");
+        finishActivity(`${modeLabel} 完了`);
       } catch (error) {
         if (error.name === "AbortError") {
           assistantNode.textContent = "キャンセルしました。";
           setStatus("cancelled", "");
+          finishActivity("キャンセルしました");
         } else {
           assistantNode.textContent = `エラー: ${error.message}`;
           setStatus("error", "");
+          finishActivity(`エラー: ${error.message}`);
         }
       } finally {
         clearInterval(stepPoll);
@@ -904,6 +1026,7 @@ HTML = """<!doctype html>
       addMessage("system", `${modelEl.value} に切り替えます。初回応答時にモデルをロードします。`);
       sendEl.disabled = true;
       setStatus("switching", "busy");
+      startActivity("モデル切替", `${modelEl.value} を選択しています`);
       fetch("/api/switch_model", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -918,6 +1041,7 @@ HTML = """<!doctype html>
             clearInterval(waitForModel);
             sendEl.disabled = false;
             setStatus("ready", "ready");
+            finishActivity("モデル切替が完了しました");
           }
         } catch (_error) {}
       }, 3000);
@@ -945,6 +1069,7 @@ HTML = """<!doctype html>
       if (isRunning) return;
       await fetch(`/api/history/${encodeURIComponent(currentUserId)}`, { method: "DELETE" });
       renderConversation([]);
+      finishActivity("履歴を削除しました");
     });
 
     logoutEl.addEventListener("click", async () => {
@@ -990,15 +1115,70 @@ def split_html_script() -> tuple[str, str]:
     return shell, script
 
 
-def render_html(user_id: str = "", display_name: str = "") -> str:
+def render_html(
+    user_id: str = "",
+    display_name: str = "",
+    messages: list | None = None,
+    active_job: dict | None = None,
+) -> str:
     shell, _ = split_html_script()
     safe_user_id = html.escape(user_id, quote=True)
     safe_display_name = html.escape(display_name or user_id, quote=True)
+    model_options = "\n".join(
+        f'          <option value="{html.escape(model_id, quote=True)}"'
+        f'{" selected" if model_id == DEFAULT_MODEL_ID else ""}>'
+        f'{html.escape(spec["label"])}</option>'
+        for model_id, spec in supported_model_specs().items()
+    )
     shell = shell.replace(
         '<body data-initial-user-id="" data-initial-display-name="">',
         f'<body data-initial-user-id="{safe_user_id}" data-initial-display-name="{safe_display_name}">',
     )
+    shell = re.sub(
+        r'        <select id="model" name="model_id" aria-label="model">.*?</select>',
+        f'        <select id="model" name="model_id" aria-label="model">\n{model_options}\n        </select>',
+        shell,
+        flags=re.DOTALL,
+    )
+    if active_job and not active_job.get("done"):
+        shell = shell.replace("</head>", '  <meta http-equiv="refresh" content="2">\n</head>')
     if user_id:
+        rendered_messages = ['        <div class="message system">選択した Qwen モデルが Intel Gaudi HPU 上で応答します。</div>']
+        for message in messages or []:
+            role = getattr(message, "role", "")
+            content = getattr(message, "content", "")
+            if role not in {"user", "assistant"}:
+                continue
+            rendered_messages.append(
+                f'        <div class="message {role}">{html.escape(content)}</div>'
+            )
+        if active_job:
+            step_lines = []
+            for step in active_job.get("steps", []):
+                status = html.escape(step.get("status", "pending"), quote=True)
+                label = html.escape(step.get("label", "処理中"))
+                detail = html.escape(step.get("detail", ""))
+                detail_html = f'<div class="step-detail">{detail}</div>' if detail else ""
+                step_lines.append(
+                    f'          <div class="step {status}">'
+                    f'<span class="step-marker"></span>'
+                    f'<div><div class="step-title">{label}</div>{detail_html}</div>'
+                    f'</div>'
+                )
+            if step_lines:
+                title = "回答作成中" if not active_job.get("done") else "回答作成完了"
+                rendered_messages.append(
+                    '        <div class="steps" aria-live="polite">\n'
+                    f'          <div class="step-title">{title}</div>\n'
+                    + "\n".join(step_lines)
+                    + "\n        </div>"
+                )
+        shell = re.sub(
+            r'        <div class="message system">選択した Qwen モデルが Intel Gaudi HPU 上で応答します。</div>',
+            "\n".join(rendered_messages),
+            shell,
+            count=1,
+        )
         shell = shell.replace(
             '<section id="loginView" class="login-view">',
             '<section id="loginView" class="login-view hidden">',
@@ -1008,6 +1188,30 @@ def render_html(user_id: str = "", display_name: str = "") -> str:
             '<strong id="currentUserName"></strong>',
             f'<strong id="currentUserName">{safe_display_name}</strong>',
         )
+        if active_job:
+            state = "ready" if active_job.get("done") else "busy"
+            mode = html.escape(active_job.get("mode", "回答作成中"))
+            detail = html.escape(active_job.get("detail", "処理を進めています"))
+            elapsed = ""
+            started_at = active_job.get("started_at")
+            if started_at and not active_job.get("done"):
+                elapsed = f'{int(max(0, time.time() - float(started_at)))}s'
+            shell = shell.replace(
+                '<div id="activityBar" class="activitybar ready">',
+                f'<div id="activityBar" class="activitybar {state}">',
+            )
+            shell = shell.replace(
+                '<div id="activityMode" class="activity-mode">待機中</div>',
+                f'<div id="activityMode" class="activity-mode">{mode}</div>',
+            )
+            shell = shell.replace(
+                '<div id="activityDetail" class="activity-detail">メッセージを送信できます</div>',
+                f'<div id="activityDetail" class="activity-detail">{detail}</div>',
+            )
+            shell = shell.replace(
+                '<div id="activityElapsed" class="activity-elapsed"></div>',
+                f'<div id="activityElapsed" class="activity-elapsed">{elapsed}</div>',
+            )
     return shell
 
 
@@ -1761,6 +1965,8 @@ def create_app(model_id: str) -> FastAPI:
     progress_lock = threading.Lock()
     agent_progress: dict[str, dict] = {}
     cancel_events: dict[str, threading.Event] = {}
+    fallback_lock = threading.Lock()
+    fallback_jobs: dict[str, dict] = {}
 
     def request_key(request_id: str | None) -> str:
         return request_id or str(uuid.uuid4())
@@ -1803,6 +2009,31 @@ def create_app(model_id: str) -> FastAPI:
         steps.append(AgentStep(label="応答完了", status="pending"))
         return steps
 
+    def set_fallback_job(job_id: str, **updates) -> None:
+        with fallback_lock:
+            job = fallback_jobs.get(job_id)
+            if not job:
+                return
+            job.update(updates)
+            job["updated_at"] = time.time()
+
+    def set_fallback_step(
+        job_id: str,
+        steps: list[AgentStep],
+        index: int,
+        status: Literal["pending", "active", "done", "error"],
+        detail: str = "",
+        done: bool = False,
+    ) -> None:
+        steps[index].status = status
+        steps[index].detail = detail
+        set_fallback_job(
+            job_id,
+            steps=[step.model_dump() for step in steps],
+            detail=detail or steps[index].label,
+            done=done,
+        )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         print("Starting Gaudi Qwen chat server", flush=True)
@@ -1819,8 +2050,23 @@ def create_app(model_id: str) -> FastAPI:
     def index(request: Request) -> HTMLResponse:
         user_id = request.cookies.get("gaudi_chat_user_id", "")
         display_name = unquote(request.cookies.get("gaudi_chat_display_name", user_id))
+        job_id = request.query_params.get("job_id", "")
+        active_job = None
+        messages = []
+        if user_id:
+            try:
+                history = history_store.history(user_id)
+                display_name = history.display_name
+                messages = history.messages
+            except Exception:
+                messages = []
+            if job_id:
+                with fallback_lock:
+                    record = fallback_jobs.get(job_id)
+                    if record and record.get("user_id") == user_id:
+                        active_job = dict(record)
         return HTMLResponse(
-            render_html(user_id, display_name),
+            render_html(user_id, display_name, messages, active_job),
             headers={
                 "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
                 "Pragma": "no-cache",
@@ -1858,6 +2104,140 @@ def create_app(model_id: str) -> FastAPI:
         response.delete_cookie("gaudi_chat_user_id")
         response.delete_cookie("gaudi_chat_display_name")
         return response
+
+    def run_fallback_chat(job_id: str, chat_request: ChatRequest) -> None:
+        steps = initial_steps(chat_request.agent_mode)
+        set_fallback_job(
+            job_id,
+            steps=[step.model_dump() for step in steps],
+            mode=AGENT_MODES[chat_request.agent_mode]["label"],
+            detail="回答作成を開始しています",
+        )
+        try:
+            print(
+                f"Fallback chat start: job_id={job_id}, user={chat_request.user_id}, "
+                f"mode={chat_request.agent_mode}, model={chat_request.model_id}",
+                flush=True,
+            )
+            if engine.is_loaded and engine.active_model_id != chat_request.model_id:
+                raise RuntimeError(
+                    "Select the model in the UI first. The server restarts to switch models cleanly."
+                )
+
+            cursor = 1
+            sources: list[SearchResult] = []
+            if chat_request.agent_mode in {"web", "deep"}:
+                set_fallback_step(job_id, steps, cursor, "active", "検索クエリを実行しています")
+                search_bundle = collect_sources(
+                    chat_request.messages[-1].content,
+                    chat_request.agent_mode,
+                )
+                sources = search_bundle.sources
+                detail = f"{len(sources)} 件の候補を取得"
+                if search_bundle.warnings:
+                    detail = f"{len(sources)} 件取得。一部検索失敗: {len(search_bundle.warnings)} 件"
+                set_fallback_step(job_id, steps, cursor, "done", detail)
+                cursor += 1
+
+                set_fallback_step(job_id, steps, cursor, "active", "検索結果を回答用に整理しています")
+                if sources:
+                    set_fallback_step(job_id, steps, cursor, "done", f"{min(len(sources), 8)} 件をコンテキスト化")
+                else:
+                    set_fallback_step(job_id, steps, cursor, "done", "検索結果なし。通常プロンプトで続行")
+                cursor += 1
+
+            set_fallback_step(job_id, steps, cursor, "active", "会話履歴と条件をまとめています")
+            enriched_request = request_with_sources(chat_request, sources)
+            set_fallback_step(job_id, steps, cursor, "done", "生成用プロンプトを作成")
+            cursor += 1
+
+            detail = "モデルをロードして生成しています" if not engine.is_loaded else "HPU 上のモデルで生成しています"
+            set_fallback_step(job_id, steps, cursor, "active", detail)
+            response = engine.generate(enriched_request, sources=sources)
+            set_fallback_step(job_id, steps, cursor, "done", "生成が完了しました")
+            cursor += 1
+
+            history = history_store.history(chat_request.user_id)
+            saved_messages = list(history.messages)
+            saved_messages.append(ChatMessage(role="assistant", content=response.reply))
+            history_store.replace_history(chat_request.user_id, saved_messages)
+            set_fallback_step(job_id, steps, cursor, "done", "チャット画面へ回答を保存しました", done=True)
+            set_fallback_job(job_id, mode="完了", detail="回答を表示しました", done=True)
+            print(f"Fallback chat complete: job_id={job_id}, user={chat_request.user_id}", flush=True)
+        except Exception as exc:
+            print(f"Fallback chat error: job_id={job_id}, user={chat_request.user_id}, error={exc}", flush=True)
+            for step in steps:
+                if step.status == "active":
+                    step.status = "error"
+                    step.detail = str(exc)
+            steps[-1].status = "error"
+            steps[-1].detail = str(exc)
+            try:
+                history = history_store.history(chat_request.user_id)
+                saved_messages = list(history.messages)
+                saved_messages.append(ChatMessage(role="assistant", content=f"エラー: {exc}"))
+                history_store.replace_history(chat_request.user_id, saved_messages)
+            finally:
+                set_fallback_job(
+                    job_id,
+                    mode="エラー",
+                    detail=str(exc),
+                    steps=[step.model_dump() for step in steps],
+                    done=True,
+                )
+
+    @app.post("/chat/send")
+    async def chat_send_fallback(request: Request) -> RedirectResponse:
+        user_id = request.cookies.get("gaudi_chat_user_id", "")
+        if not user_id:
+            return RedirectResponse("/", status_code=303)
+
+        form = parse_qs((await request.body()).decode("utf-8", errors="ignore"))
+
+        def field(name: str, default: str = "") -> str:
+            values = form.get(name)
+            return values[0].strip() if values else default
+
+        prompt = field("prompt")
+        if not prompt:
+            return RedirectResponse("/", status_code=303)
+
+        model_id = field("model_id", engine.default_model_id)
+        if model_id not in supported_model_specs():
+            model_id = engine.default_model_id
+        reasoning_effort = field("reasoning_effort", "medium")
+        if reasoning_effort not in REASONING_PRESETS:
+            reasoning_effort = "medium"
+        agent_mode = field("agent_mode", "chat")
+        if agent_mode not in AGENT_MODES:
+            agent_mode = "chat"
+
+        history = history_store.history(user_id)
+        messages = list(history.messages)
+        messages.append(ChatMessage(role="user", content=prompt))
+        history_store.replace_history(user_id, messages)
+        chat_request = ChatRequest(
+            user_id=user_id,
+            model_id=model_id,
+            messages=messages,
+            reasoning_effort=reasoning_effort,  # type: ignore[arg-type]
+            agent_mode=agent_mode,  # type: ignore[arg-type]
+        )
+        job_id = str(uuid.uuid4())
+        steps = initial_steps(agent_mode)
+        with fallback_lock:
+            fallback_jobs[job_id] = {
+                "user_id": user_id,
+                "mode": AGENT_MODES[agent_mode]["label"],
+                "detail": "回答作成を開始しています",
+                "steps": [step.model_dump() for step in steps],
+                "done": False,
+                "started_at": time.time(),
+                "updated_at": time.time(),
+            }
+        worker = threading.Thread(target=run_fallback_chat, args=(job_id, chat_request), daemon=True)
+        worker.start()
+        return RedirectResponse(f"/?job_id={job_id}", status_code=303)
 
     @app.get("/api/health")
     def health() -> dict:
@@ -2021,63 +2401,102 @@ def create_app(model_id: str) -> FastAPI:
                     status_code=409,
                     detail="Select the model in the UI first. The server restarts to switch models cleanly.",
                 )
-            cursor = 1
-            if request.agent_mode in {"web", "deep"}:
-                update_step(request_id, steps, cursor, "active", "検索クエリを実行しています")
-                search_bundle = collect_sources(
-                    request.messages[-1].content,
-                    request.agent_mode,
-                    cancel_event=cancel_event,
-                )
-                sources = search_bundle.sources
-                if search_bundle.warnings:
-                    detail = f"{len(sources)} 件取得。一部検索失敗: {len(search_bundle.warnings)} 件"
-                else:
-                    detail = f"{len(sources)} 件の候補を取得"
-                update_step(request_id, steps, cursor, "done", detail)
-                cursor += 1
-                update_step(request_id, steps, cursor, "active", "モデルへ渡す根拠を整えています")
-                if cancel_event.is_set():
-                    raise RequestCancelled()
-                if sources:
-                    update_step(request_id, steps, cursor, "done", f"{min(len(sources), 8)} 件をコンテキスト化")
-                else:
-                    update_step(request_id, steps, cursor, "done", "検索結果なし。通常プロンプトで続行")
-                cursor += 1
-            else:
-                sources = []
-            update_step(request_id, steps, cursor, "active", "会話履歴とエージェント結果を結合しています")
-            if cancel_event.is_set():
-                raise RequestCancelled()
-            enriched_request = request_with_sources(request, sources)
-            update_step(request_id, steps, cursor, "done", "生成用プロンプトを作成")
-            cursor += 1
-            update_step(request_id, steps, cursor, "active", "HPU 上のモデルで生成しています")
         except HTTPException:
             update_step(request_id, steps, len(steps) - 1, "error", "リクエストを完了できませんでした", done=True)
             raise
-        except RequestCancelled as exc:
-            for step in steps:
-                if step.status == "active":
-                    step.status = "error"
-                    step.detail = "キャンセルされました"
-            steps[-1].status = "error"
-            steps[-1].detail = "ユーザーがリクエストをキャンセルしました"
-            set_steps(request_id, steps, done=True)
-            raise HTTPException(status_code=499, detail="Request cancelled") from exc
-        except requests.RequestException as exc:
-            update_step(request_id, steps, len(steps) - 1, "error", f"Web検索に失敗しました: {exc}", done=True)
-            raise HTTPException(status_code=502, detail=f"Web search failed: {exc}") from exc
-        except Exception as exc:
-            update_step(request_id, steps, len(steps) - 1, "error", str(exc), done=True)
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         def line(event: dict) -> str:
             return json.dumps(event, ensure_ascii=False) + "\n"
 
+        def status_event(message: str, status: str = "working") -> str:
+            return line(
+                {
+                    "type": "status",
+                    "message": message,
+                    "status": status,
+                    "steps": [step.model_dump() for step in steps],
+                }
+            )
+
         def stream_events():
             final_sent = False
+            sources: list[SearchResult] = []
             try:
+                print(
+                    f"Chat request start: request_id={request_id}, user={request.user_id}, "
+                    f"mode={request.agent_mode}, model={request.model_id}, messages={len(request.messages)}",
+                    flush=True,
+                )
+                yield status_event(f"{AGENT_MODES[request.agent_mode]['label']} を開始しています")
+
+                cursor = 1
+                if request.agent_mode in {"web", "deep"}:
+                    queries = search_queries(request.messages[-1].content, request.agent_mode)
+                    update_step(
+                        request_id,
+                        steps,
+                        cursor,
+                        "active",
+                        f"{len(queries)} 個の検索クエリを実行しています",
+                    )
+                    print(
+                        f"Search start: request_id={request_id}, mode={request.agent_mode}, queries={queries}",
+                        flush=True,
+                    )
+                    yield status_event("Web検索中です")
+                    search_bundle = collect_sources(
+                        request.messages[-1].content,
+                        request.agent_mode,
+                        cancel_event=cancel_event,
+                    )
+                    sources = search_bundle.sources
+                    if search_bundle.warnings:
+                        detail = f"{len(sources)} 件取得。一部検索失敗: {len(search_bundle.warnings)} 件"
+                    else:
+                        detail = f"{len(sources)} 件の候補を取得"
+                    update_step(request_id, steps, cursor, "done", detail)
+                    print(
+                        f"Search complete: request_id={request_id}, sources={len(sources)}, "
+                        f"warnings={len(search_bundle.warnings)}",
+                        flush=True,
+                    )
+                    yield status_event(f"Web検索完了: {detail}")
+                    cursor += 1
+
+                    update_step(request_id, steps, cursor, "active", "モデルへ渡す根拠を整えています")
+                    if cancel_event.is_set():
+                        raise RequestCancelled()
+                    if sources:
+                        update_step(request_id, steps, cursor, "done", f"{min(len(sources), 8)} 件をコンテキスト化")
+                    else:
+                        update_step(request_id, steps, cursor, "done", "検索結果なし。通常プロンプトで続行")
+                    yield status_event("検索結果をプロンプトへ反映しました")
+                    cursor += 1
+
+                update_step(request_id, steps, cursor, "active", "会話履歴とエージェント結果を結合しています")
+                if cancel_event.is_set():
+                    raise RequestCancelled()
+                enriched_request = request_with_sources(request, sources)
+                update_step(request_id, steps, cursor, "done", "生成用プロンプトを作成")
+                cursor += 1
+                update_step(request_id, steps, cursor, "active", "HPU 上のモデルで生成しています")
+                print(f"Generation start: request_id={request_id}, mode={request.agent_mode}", flush=True)
+                yield status_event("モデル生成中です")
+                if not engine.is_loaded or engine.active_model_id != enriched_request.model_id:
+                    update_step(
+                        request_id,
+                        steps,
+                        cursor,
+                        "active",
+                        f"初回モデルロード中です: {enriched_request.model_id}",
+                    )
+                    print(
+                        f"Model load pending before generation: request_id={request_id}, "
+                        f"model={enriched_request.model_id}",
+                        flush=True,
+                    )
+                    yield status_event(f"初回モデルロード中です: {enriched_request.model_id}")
+
                 for event in engine.stream_generate(enriched_request, sources=sources, cancel_event=cancel_event):
                     if event["type"] == "final":
                         response = ChatResponse(**event["data"])
@@ -2090,6 +2509,11 @@ def create_app(model_id: str) -> FastAPI:
                         steps[-1].detail = "ブラウザへ応答を返しました"
                         set_steps(request_id, steps, done=True)
                         final_sent = True
+                        print(
+                            f"Chat request complete: request_id={request_id}, mode={request.agent_mode}, "
+                            f"tokens={response.generated_tokens}, elapsed={response.elapsed_sec:.2f}s",
+                            flush=True,
+                        )
                     yield line(event)
             except RequestCancelled:
                 for step in steps:
@@ -2099,9 +2523,15 @@ def create_app(model_id: str) -> FastAPI:
                 steps[-1].status = "error"
                 steps[-1].detail = "ユーザーがリクエストをキャンセルしました"
                 set_steps(request_id, steps, done=True)
+                print(f"Chat request cancelled: request_id={request_id}", flush=True)
                 yield line({"type": "error", "detail": "Request cancelled"})
+            except requests.RequestException as exc:
+                update_step(request_id, steps, len(steps) - 1, "error", f"Web検索に失敗しました: {exc}", done=True)
+                print(f"Chat request search error: request_id={request_id}, error={exc}", flush=True)
+                yield line({"type": "error", "detail": f"Web search failed: {exc}"})
             except Exception as exc:
                 update_step(request_id, steps, len(steps) - 1, "error", str(exc), done=True)
+                print(f"Chat request error: request_id={request_id}, error={exc}", flush=True)
                 yield line({"type": "error", "detail": str(exc)})
             finally:
                 with progress_lock:
@@ -2133,14 +2563,11 @@ def create_app(model_id: str) -> FastAPI:
         def restart() -> None:
             env = os.environ.copy()
             env["MODEL_ID"] = request.model_id
-            env["APP_ENV"] = APP_ENV
             env["SERVER_HOST"] = SERVER_HOST
             env["SERVER_PORT"] = str(SERVER_PORT)
             args = [
                 sys.executable,
                 os.path.abspath(__file__),
-                "--env",
-                APP_ENV,
                 "--host",
                 SERVER_HOST,
                 "--port",
@@ -2159,16 +2586,10 @@ def create_app(model_id: str) -> FastAPI:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve a web chat UI for Qwen on Gaudi.")
     parser.add_argument("--model-id", default=os.environ.get("MODEL_ID", DEFAULT_MODEL_ID), choices=sorted(supported_model_specs()))
-    parser.add_argument(
-        "--env",
-        choices=("production", "development", "prod", "dev"),
-        default=os.environ.get("APP_ENV", "production"),
-    )
     parser.add_argument("--host", default=os.environ.get("SERVER_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=None)
     args = parser.parse_args()
-    args.env = normalize_app_env(args.env)
-    args.port = args.port or int(os.environ.get("SERVER_PORT", DEFAULT_SERVER_PORTS[args.env]))
+    args.port = args.port or int(os.environ.get("SERVER_PORT", DEFAULT_SERVER_PORT))
     return args
 
 
@@ -2179,7 +2600,6 @@ if __name__ == "__main__":
     import uvicorn
 
     args = parse_args()
-    APP_ENV = args.env
     SERVER_HOST = args.host
     SERVER_PORT = args.port
     app = create_app(args.model_id)
