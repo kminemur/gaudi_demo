@@ -88,6 +88,11 @@ MODEL_SPECS = {
         "kind": "causal_lm",
         "precision": "bf16",
     },
+    "Qwen/Qwen3-235B-A22B": {
+        "label": "Qwen3 235B A22B",
+        "kind": "causal_lm",
+        "precision": "bf16",
+    },
 }
 MODEL_REQUIRED_TYPES = {
     "Qwen/Qwen3.6-27B-FP8": "qwen3_5",
@@ -710,6 +715,7 @@ HTML = """<!doctype html>
                 <option value="Qwen/Qwen3.6-27B-FP8">Qwen3.6 27B FP8</option>
                 <option value="Qwen/Qwen3.6-35B-A3B-FP8">Qwen3.6 35B A3B FP8</option>
                 <option value="Qwen/Qwen3-32B">Qwen3 32B</option>
+                <option value="Qwen/Qwen3-235B-A22B">Qwen3 235B A22B</option>
               </select>
               <select id="reasoning" name="reasoning_effort" aria-label="reasoning strength">
                 <option value="low">Low</option>

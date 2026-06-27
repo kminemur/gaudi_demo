@@ -255,6 +255,7 @@ archived       : 一覧から隠す場合 true
 | `Qwen/Qwen3.6-27B-FP8` | image_text | fp8 pretrained | 現行 HPU 経路では bf16 へフォールバック |
 | `Qwen/Qwen3.6-35B-A3B-FP8` | image_text | fp8 pretrained | `qwen3_5` 対応 Transformers が必要 |
 | `Qwen/Qwen3-32B` | causal_lm | bf16 | Optimum Habana 互換 venv の標準 fallback |
+| `Qwen/Qwen3-235B-A22B` | causal_lm | bf16 | Qwen3 MoE。単一 HPU 配置では十分な HPU メモリ、または multi-HPU 配置が必要 |
 
 デフォルトモデル:
 

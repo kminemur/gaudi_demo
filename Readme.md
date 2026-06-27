@@ -53,6 +53,7 @@ The UI can switch between:
 - `Qwen/Qwen3.6-27B-FP8`
 - `Qwen/Qwen3.6-35B-A3B-FP8`
 - `Qwen/Qwen3-32B`
+- `Qwen/Qwen3-235B-A22B`
 
 The reasoning strength selector changes the speed/depth tradeoff:
 
@@ -173,6 +174,11 @@ HF_HOME=$PWD/hf_cache PT_HPU_WEIGHT_SHARING=0 \
 This venv supports Qwen3 models such as `Qwen/Qwen3-32B`. It does not support
 Qwen3.6 checkpoints such as `Qwen/Qwen3.6-27B`, because those require the newer
 `qwen3_5` architecture in Transformers 5.x.
+
+`Qwen/Qwen3-235B-A22B` is available as a Qwen3 causal LM option. The current demo
+uses a single-HPU Transformers placement, so this checkpoint requires enough HPU
+memory for the full model or a future multi-HPU placement path before it can be
+used reliably.
 
 `Qwen/Qwen3-32B-FP8` is accepted by the CLI, but the current HPU + Optimum Habana
 FP8 path creates an FP8 KV cache while the model produces bf16 key/value states.
