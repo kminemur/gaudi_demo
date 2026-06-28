@@ -69,6 +69,19 @@ Then open `http://<server-ip>:8000/`.
 
 You can override the default with `SERVER_PORT` or `--port`.
 
+For the 235B chat server on 8 Gaudi HPUs, start it with tensor parallel. Rank 0
+serves HTTP; the other ranks participate in model generation:
+
+```bash
+PATH=/home/test1/habanalabs-venv-optimum/bin:$PATH \
+HF_HOME=$PWD/hf_cache \
+/home/test1/habanalabs-venv-optimum/bin/python -m torch.distributed.run \
+  --standalone --nproc_per_node=8 \
+  chat_server.py \
+  --host 0.0.0.0 \
+  --tensor-parallel-size 8
+```
+
 To keep the server running in the background after closing the terminal, start it
 with `nohup`:
 

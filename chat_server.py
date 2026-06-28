@@ -26,12 +26,14 @@ os.environ.setdefault("PT_HPU_LAZY_MODE", "0")
 os.environ.setdefault("PT_HPU_WEIGHT_SHARING", "0")
 
 import torch
+import torch.distributed as dist
 import habana_frameworks.torch.core as htcore
 import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoProcessor,
@@ -43,7 +45,7 @@ from transformers import (
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 
-COMPAT_DEFAULT_MODEL_ID = "Qwen/Qwen3-32B"
+COMPAT_DEFAULT_MODEL_ID = "Qwen/Qwen3-235B-A22B"
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_HF_HOME = PROJECT_ROOT / "hf_cache"
 
@@ -62,16 +64,13 @@ SEARCH_TIMEOUT_SEC = float(os.environ.get("SEARCH_TIMEOUT_SEC", "8"))
 AUTO_SEARCH_DEFAULT = os.environ.get("AUTO_SEARCH_DEFAULT", "1") == "1"
 HPU_EXECUTION_MODE = "lazy" if os.environ.get("PT_HPU_LAZY_MODE") == "1" else "eager"
 USE_INT32_INPUTS = os.environ.get("USE_INT32_INPUTS", "1") == "1"
-MODEL_PLACEMENT = "single_hpu_transformers"
+MODEL_PLACEMENT = "tensor_parallel_transformers"
 OPTIMUM_HABANA_ENABLED: bool | None = None
 MODEL_LOCAL_FILES_ONLY = os.environ.get("CHAT_MODEL_LOCAL_FILES_ONLY", "1") != "0"
 HF_MODEL_REVISION = os.environ.get("HF_MODEL_REVISION", "main")
+MULTI_HPU_MAX_MEMORY_GIB = int(os.environ.get("CHAT_MULTI_HPU_MAX_MEMORY_GIB", "68"))
+MULTI_HPU_MAX_MEMORY_SEARCH_LIMIT_GIB = int(os.environ.get("CHAT_MULTI_HPU_MAX_MEMORY_SEARCH_LIMIT_GIB", "72"))
 MODEL_SPECS = {
-    "Qwen/Qwen3-32B": {
-        "label": "Qwen3 32B",
-        "kind": "causal_lm",
-        "precision": "bf16",
-    },
     "Qwen/Qwen3-235B-A22B": {
         "label": "Qwen3 235B A22B",
         "kind": "causal_lm",
@@ -89,6 +88,53 @@ def is_model_supported(model_id: str) -> bool:
 
 def supported_model_specs() -> dict[str, dict[str, str]]:
     return {model_id: spec for model_id, spec in MODEL_SPECS.items() if is_model_supported(model_id)}
+
+
+def get_rank() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    return int(os.environ.get("RANK", "0"))
+
+
+def get_world_size() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+
+def print_main(message: str) -> None:
+    if is_main_process():
+        print(message, flush=True)
+
+
+def setup_tensor_parallel(tensor_parallel_size: int) -> None:
+    if tensor_parallel_size < 1:
+        raise ValueError("--tensor-parallel-size must be >= 1.")
+    if tensor_parallel_size == 1:
+        return
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size != tensor_parallel_size:
+        raise RuntimeError(
+            "Tensor parallel requires torchrun with matching process count. "
+            f"Run with: torchrun --standalone --nproc_per_node={tensor_parallel_size} "
+            f"{Path(__file__).name} --tensor-parallel-size {tensor_parallel_size}"
+        )
+    if torch.hpu.device_count() < tensor_parallel_size:
+        raise RuntimeError(
+            f"--tensor-parallel-size={tensor_parallel_size} requested, but only "
+            f"{torch.hpu.device_count()} HPU devices are available."
+        )
+    if dist.is_available() and not dist.is_initialized():
+        dist.init_process_group(backend="hccl", rank=get_rank(), world_size=world_size)
+
+
+def get_tensor_parallel_plan(model_id: str) -> str | dict[str, str]:
+    return "auto"
 
 
 def is_fp8_model(model_id: str) -> bool:
@@ -734,8 +780,7 @@ HTML = """<!doctype html>
             <div class="option-title">オプション</div>
             <div class="option-controls">
               <select id="model" name="model_id" aria-label="model">
-                <option value="Qwen/Qwen3-32B" selected>Qwen3 32B</option>
-                <option value="Qwen/Qwen3-235B-A22B">Qwen3 235B A22B</option>
+                <option value="Qwen/Qwen3-235B-A22B" selected>Qwen3 235B A22B</option>
               </select>
               <select id="reasoning" name="reasoning_effort" aria-label="reasoning strength">
                 <option value="low">Low</option>
@@ -1259,29 +1304,29 @@ HTML = """<!doctype html>
 
     cancelJobEl.addEventListener("click", cancelActiveRequest);
 
-    modelEl.addEventListener("change", () => {
-      addMessage("system", `${modelEl.value} に切り替えます。初回応答時にモデルをロードします。`);
+    modelEl.addEventListener("change", async () => {
+      addMessage("system", `${modelEl.value} に切り替えます。`);
       sendEl.disabled = true;
       setStatus("switching", "busy");
-      startActivity("モデル切替", `${modelEl.value} を選択しています`);
-      fetch("/api/switch_model", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model_id: modelEl.value })
-      }).catch((_error) => {});
+      startActivity("モデル切替", `${modelEl.value} を有効化しています`);
       const selectedModel = modelEl.value;
-      const waitForModel = setInterval(async () => {
-        try {
-          const res = await fetch("/api/health");
-          const data = await res.json();
-          if (data.default_model_id === selectedModel && (!data.model_loaded || data.active_model_id === selectedModel)) {
-            clearInterval(waitForModel);
-            sendEl.disabled = false;
-            setStatus("ready", "ready");
-            finishActivity("モデル切替が完了しました");
-          }
-        } catch (_error) {}
-      }, 3000);
+      try {
+        const res = await fetch("/api/switch_model", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model_id: selectedModel })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "モデル切替に失敗しました");
+        syncModelOptions(data);
+        setStatus("ready", "ready");
+        finishActivity("モデル切替が完了しました");
+      } catch (error) {
+        setStatus("error", "");
+        finishActivity(`エラー: ${error.message}`);
+      } finally {
+        sendEl.disabled = false;
+      }
     });
 
     loginFormEl.addEventListener("submit", async (event) => {
@@ -2233,18 +2278,20 @@ def enable_optimum_habana() -> bool:
 
 
 class ChatEngine:
-    def __init__(self, default_model_id: str) -> None:
+    def __init__(self, default_model_id: str, tensor_parallel_size: int = 1) -> None:
         self.default_model_id = default_model_id
+        self.tensor_parallel_size = tensor_parallel_size
         self.active_model_id = None
         self.model_kind = None
         self.tokenizer = None
         self.model = None
+        self.device = "hpu"
+        self.loaded_models: dict[str, dict[str, object]] = {}
         self.lock = threading.Lock()
         self.loaded_at = None
         self.precision = "bf16"
 
-    def load(self, model_id: str | None = None) -> None:
-        model_id = model_id or self.default_model_id
+    def validate_model_id(self, model_id: str) -> None:
         if model_id not in MODEL_SPECS:
             raise ValueError(f"Unsupported model: {model_id}")
         if not is_model_supported(model_id):
@@ -2254,22 +2301,141 @@ class ChatEngine:
                 f"This environment provides transformers=={package_version('transformers')}; "
                 f"use {COMPAT_DEFAULT_MODEL_ID} or run with /home/test1/habanalabs-venv/bin/python."
             )
-        if self.is_loaded and self.active_model_id == model_id:
-            return
 
+    def hpu_device_for_index(self, index: int) -> str:
+        device_count = torch.hpu.device_count()
+        if device_count <= 0:
+            raise RuntimeError("HPU is not available. Check Habana driver/runtime setup.")
+        if index >= device_count:
+            raise RuntimeError(
+                f"Cannot preload {index + 1} models across {device_count} HPU device(s). "
+                "Use fewer models or expose more HPU devices."
+            )
+        return f"hpu:{index}"
+
+    def hpu_devices_for_model(self, model_id: str, index: int, total_models: int) -> list[str]:
+        if self.tensor_parallel_size > 1:
+            return ["hpu"]
+        device_count = torch.hpu.device_count()
+        if device_count <= 0:
+            raise RuntimeError("HPU is not available. Check Habana driver/runtime setup.")
+        if device_count < total_models:
+            raise RuntimeError(
+                f"Cannot preload {total_models} models across {device_count} HPU device(s). "
+                "Use fewer models or expose more HPU devices."
+            )
+        if "235B" in model_id and device_count > 1:
+            start_device = 1 if total_models > 1 else 0
+            return [f"hpu:{device_index}" for device_index in range(start_device, device_count)]
+        if "235B" not in model_id:
+            return ["hpu:0"]
+        return [self.hpu_device_for_index(index)]
+
+    def preload_order(self, model_ids: list[str]) -> list[str]:
+        return sorted(model_ids, key=lambda model_id: (0 if "235B" in model_id else 1, model_id))
+
+    def device_map_and_memory_for_devices(
+        self,
+        model_cls,
+        pretrained_source: str,
+        pretrained_kwargs: dict[str, object],
+        devices: list[str],
+        dtype,
+    ) -> tuple[str | dict[str, str], dict[int | str, int | str] | None]:
+        if len(devices) == 1:
+            return {"": devices[0]}, None
+
+        try:
+            from accelerate import init_empty_weights, infer_auto_device_map
+        except Exception as error:
+            raise RuntimeError(f"accelerate is required for multi-HPU loading: {error}") from error
+
+        config = AutoConfig.from_pretrained(pretrained_source, **pretrained_kwargs)
+        with init_empty_weights():
+            empty_model = model_cls.from_config(config)
+        try:
+            last_invalid_devices: set[str] = set()
+            for cap_gib in range(MULTI_HPU_MAX_MEMORY_GIB, MULTI_HPU_MAX_MEMORY_SEARCH_LIMIT_GIB + 1):
+                max_memory = self.max_memory_for_devices(devices, cap_gib)
+                device_map = infer_auto_device_map(
+                    empty_model,
+                    max_memory=max_memory,
+                    dtype=dtype,
+                    no_split_module_classes=getattr(empty_model, "_no_split_modules", None),
+                )
+                normalized_map = {
+                    module_name: self.normalize_device_map_value(device)
+                    for module_name, device in device_map.items()
+                }
+                invalid_devices = {
+                    str(device)
+                    for device in normalized_map.values()
+                    if str(device) in {"cpu", "disk"} or not str(device).startswith("hpu")
+                }
+                if invalid_devices:
+                    last_invalid_devices = invalid_devices
+                    continue
+
+                counts: dict[str, int] = {}
+                for device in normalized_map.values():
+                    counts[str(device)] = counts.get(str(device), 0) + 1
+                print(
+                    f"Inferred multi-HPU device map: cap={cap_gib}GiB, counts={counts}",
+                    flush=True,
+                )
+                return normalized_map, max_memory
+        finally:
+            del empty_model
+            gc.collect()
+
+        raise RuntimeError(
+            f"235B device map requires unavailable offload devices: {sorted(last_invalid_devices)}. "
+            f"Tried CHAT_MULTI_HPU_MAX_MEMORY_GIB={MULTI_HPU_MAX_MEMORY_GIB} through "
+            f"{MULTI_HPU_MAX_MEMORY_SEARCH_LIMIT_GIB}GiB without a pure HPU map."
+        )
+
+    def normalize_device_map_value(self, device) -> str:
+        if isinstance(device, int):
+            return f"hpu:{device}"
+        if isinstance(device, str) and device.isdigit():
+            return f"hpu:{device}"
+        return str(device)
+
+    def hpu_device_index(self, device: str) -> int:
+        return int(device.split(":", 1)[1]) if ":" in device else 0
+
+    def max_memory_for_devices(
+        self,
+        devices: list[str],
+        cap_gib: int | None = None,
+    ) -> dict[int | str, int | str] | None:
+        if len(devices) == 1:
+            return None
+        cap_gib = cap_gib or MULTI_HPU_MAX_MEMORY_GIB
+        max_memory: dict[int | str, int | str] = {"cpu": "0GiB"}
+        for device in devices:
+            device_index = self.hpu_device_index(device)
+            free_memory = torch.hpu.mem_get_info(device_index)[0]
+            capped_memory = min(free_memory, cap_gib * 1024**3)
+            max_memory[device_index] = capped_memory
+        return max_memory
+
+    def load_model_state(self, model_id: str, devices: list[str]) -> dict[str, object]:
+        self.validate_model_id(model_id)
         if not torch.hpu.is_available():
             raise RuntimeError("HPU is not available. Check Habana driver/runtime setup.")
 
-        self.unload()
+        device = "hpu" if self.tensor_parallel_size > 1 else devices[0]
+        torch.hpu.set_device(device)
         htcore.hpu_inference_set_env()
         optimum_enabled = enable_optimum_habana()
         spec = MODEL_SPECS[model_id]
         execution_model_id = resolve_execution_model_id(model_id)
         started = time.time()
-        print(
+        print_main(
             f"Loading model: requested={model_id}, execution={execution_model_id}, "
-            f"kind={spec['kind']}, precision={spec['precision']}",
-            flush=True,
+            f"kind={spec['kind']}, precision={spec['precision']}, "
+            f"tensor_parallel_size={self.tensor_parallel_size}, devices={devices}",
         )
         pretrained_source, pretrained_kwargs = resolve_pretrained_source(execution_model_id)
         if spec["kind"] == "image_text":
@@ -2281,42 +2447,106 @@ class ChatEngine:
 
         if is_fp8_model(execution_model_id):
             model_kwargs = {}
+            inferred_dtype = None
         elif spec["kind"] == "image_text":
             model_kwargs = {"dtype": torch.bfloat16}
+            inferred_dtype = torch.bfloat16
         else:
             model_kwargs = {"torch_dtype": torch.bfloat16}
-        self.model = model_cls.from_pretrained(
-            pretrained_source,
+            inferred_dtype = torch.bfloat16
+        load_kwargs = {
             **model_kwargs,
             **pretrained_kwargs,
-            low_cpu_mem_usage=True,
-            device_map={"": "hpu"},
+            "low_cpu_mem_usage": True,
+        }
+        if self.tensor_parallel_size > 1:
+            load_kwargs["tp_plan"] = get_tensor_parallel_plan(execution_model_id)
+            load_kwargs["tp_size"] = self.tensor_parallel_size
+        else:
+            device_map, max_memory = self.device_map_and_memory_for_devices(
+                model_cls,
+                pretrained_source,
+                pretrained_kwargs,
+                devices,
+                inferred_dtype,
+            )
+            load_kwargs["device_map"] = device_map
+            load_kwargs["max_memory"] = max_memory
+        model = model_cls.from_pretrained(
+            pretrained_source,
+            **load_kwargs,
         )
-        self.model.eval()
-        self.tokenizer = tokenizer
-        self.active_model_id = model_id
-        self.model_kind = spec["kind"]
+        model.eval()
         htcore.mark_step()
         torch.hpu.synchronize()
-        self.precision = (
+        precision = (
             f"bf16 fallback from {model_id}" if execution_model_id != model_id else spec["precision"]
         )
-        self.loaded_at = time.time()
-        print(
-            f"Model load complete: requested={model_id}, active={self.active_model_id}, "
-            f"elapsed={self.loaded_at - started:.1f}s, precision={self.precision}",
-            flush=True,
+        loaded_at = time.time()
+        print_main(
+            f"Model load complete: requested={model_id}, elapsed={loaded_at - started:.1f}s, "
+            f"precision={precision}, tensor_parallel_size={self.tensor_parallel_size}, devices={devices}",
         )
         if not optimum_enabled:
-            print("Continuing with Transformers + habana_frameworks fallback.", flush=True)
+            print_main("Continuing with Transformers + habana_frameworks fallback.")
+        return {
+            "model": model,
+            "tokenizer": tokenizer,
+            "model_kind": spec["kind"],
+            "precision": precision,
+            "loaded_at": loaded_at,
+            "device": device,
+            "devices": devices,
+        }
+
+    def load(self, model_id: str | None = None) -> None:
+        model_id = model_id or self.default_model_id
+        self.validate_model_id(model_id)
+        if model_id not in self.loaded_models:
+            self.loaded_models[model_id] = self.load_model_state(
+                model_id,
+                self.hpu_devices_for_model(model_id, len(self.loaded_models), len(supported_model_specs())),
+            )
+        self.activate(model_id)
+
+    def preload(self, model_ids: list[str] | None = None) -> None:
+        model_ids = self.preload_order(model_ids or list(supported_model_specs()))
+        with self.lock:
+            for index, model_id in enumerate(model_ids):
+                if model_id not in self.loaded_models:
+                    self.loaded_models[model_id] = self.load_model_state(
+                        model_id,
+                        self.hpu_devices_for_model(model_id, index, len(model_ids)),
+                    )
+            self.activate(self.default_model_id if self.default_model_id in self.loaded_models else model_ids[0])
+
+    def activate(self, model_id: str) -> None:
+        self.validate_model_id(model_id)
+        if model_id not in self.loaded_models:
+            raise RuntimeError(f"Model is not loaded: {model_id}")
+        state = self.loaded_models[model_id]
+        self.model = state["model"]
+        self.tokenizer = state["tokenizer"]
+        self.active_model_id = model_id
+        self.default_model_id = model_id
+        self.model_kind = state["model_kind"]
+        self.precision = str(state["precision"])
+        self.loaded_at = float(state["loaded_at"])
+        self.device = str(state["device"])
+        torch.hpu.set_device(self.device)
+        print(f"Active model switched: {model_id} on {self.device}", flush=True)
 
     def unload(self) -> None:
-        if self.model is not None:
-            del self.model
+        for state in self.loaded_models.values():
+            model = state.get("model")
+            if model is not None:
+                del model
+        self.loaded_models = {}
         self.model = None
         self.tokenizer = None
         self.active_model_id = None
         self.model_kind = None
+        self.device = "hpu"
         self.loaded_at = None
         self.precision = "bf16"
         gc.collect()
@@ -2354,6 +2584,100 @@ class ChatEngine:
             return self.tokenizer(text=[text], return_tensors="pt")
         return self.tokenizer([text], return_tensors="pt")
 
+    def broadcast_command(self, command: dict) -> None:
+        if self.tensor_parallel_size <= 1:
+            return
+        dist.broadcast_object_list([command], src=0)
+
+    def worker_loop(self) -> None:
+        self.preload(list(supported_model_specs()))
+        print_main("Tensor parallel worker loop should only run on non-main ranks.")
+        while True:
+            command_box = [None]
+            dist.broadcast_object_list(command_box, src=0)
+            command = command_box[0] or {}
+            if command.get("type") == "shutdown":
+                break
+            if command.get("type") != "generate":
+                continue
+            request = ChatRequest(**command["request"])
+            with self.lock:
+                self.load(request.model_id)
+                self._generate_loaded(request, sources=[], cancel_event=None)
+
+    def _generate_loaded(
+        self,
+        request: ChatRequest,
+        sources: list[SearchResult] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> ChatResponse:
+        sources = sources or []
+        assert self.tokenizer is not None
+        assert self.model is not None
+        if cancel_event and cancel_event.is_set():
+            raise RequestCancelled()
+
+        text = self.render_prompt(request)
+        inputs = self.tokenize(text)
+        if USE_INT32_INPUTS:
+            for key in ("input_ids", "attention_mask"):
+                if key in inputs:
+                    inputs[key] = inputs[key].to(dtype=torch.int32)
+        torch.hpu.set_device(self.device)
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+
+        prompt_len = inputs["input_ids"].shape[-1]
+        do_sample = request.temperature > 0
+        stopping_criteria = CancelStoppingCriteria(cancel_event, prompt_len)
+        generation_kwargs = {
+            **inputs,
+            "max_new_tokens": self.max_new_tokens(request),
+            "do_sample": do_sample,
+            "pad_token_id": self.eos_token_id(),
+            "use_cache": True,
+            "stopping_criteria": StoppingCriteriaList([stopping_criteria]),
+        }
+        if do_sample:
+            generation_kwargs["temperature"] = request.temperature
+            generation_kwargs["top_p"] = request.top_p
+
+        torch.hpu.synchronize()
+        started = time.perf_counter()
+        stopping_criteria.start()
+        with torch.inference_mode():
+            output_ids = self.model.generate(**generation_kwargs)
+            htcore.mark_step()
+            torch.hpu.synchronize()
+
+        if cancel_event and cancel_event.is_set():
+            raise RequestCancelled()
+
+        finished = time.perf_counter()
+        generated_ids = output_ids[:, prompt_len:]
+        generated_tokens = int(generated_ids.shape[-1])
+        reply = self.clean_reply(self.decode(generated_ids))
+        if not reply:
+            reply = "High の推論でトークン上限に達しました。Medium に下げるか、上限を増やしてください。"
+
+        elapsed_sec = finished - started
+        ttft_sec = stopping_criteria.ttft or elapsed_sec
+        decode_sec = max(elapsed_sec - (stopping_criteria.ttft or 0.0), 1e-9)
+        tps_tokens = max(generated_tokens - 1, 0) if stopping_criteria.ttft is not None else generated_tokens
+        tokens_per_sec = tps_tokens / decode_sec
+        return ChatResponse(
+            reply=reply,
+            precision=self.precision,
+            reasoning_effort=request.reasoning_effort,
+            agent_mode=request.agent_mode,
+            sources=sources,
+            effective_max_new_tokens=self.max_new_tokens(request),
+            enable_thinking=self.enable_thinking(request),
+            elapsed_sec=elapsed_sec,
+            ttft_sec=ttft_sec,
+            tokens_per_sec=tokens_per_sec,
+            generated_tokens=generated_tokens,
+        )
+
     def generate(
         self,
         request: ChatRequest,
@@ -2369,65 +2693,17 @@ class ChatEngine:
             assert self.model is not None
             if cancel_event and cancel_event.is_set():
                 raise RequestCancelled()
-
-            text = self.render_prompt(request)
-            inputs = self.tokenize(text)
-            if USE_INT32_INPUTS:
-                for key in ("input_ids", "attention_mask"):
-                    if key in inputs:
-                        inputs[key] = inputs[key].to(dtype=torch.int32)
-            inputs = {key: value.to("hpu") for key, value in inputs.items()}
-
-            prompt_len = inputs["input_ids"].shape[-1]
-            do_sample = request.temperature > 0
-            stopping_criteria = CancelStoppingCriteria(cancel_event, prompt_len)
-            generation_kwargs = {
-                **inputs,
-                "max_new_tokens": self.max_new_tokens(request),
-                "do_sample": do_sample,
-                "pad_token_id": self.eos_token_id(),
-                "use_cache": True,
-                "stopping_criteria": StoppingCriteriaList([stopping_criteria]),
-            }
-            if do_sample:
-                generation_kwargs["temperature"] = request.temperature
-                generation_kwargs["top_p"] = request.top_p
-
-            torch.hpu.synchronize()
-            started = time.perf_counter()
-            stopping_criteria.start()
-            with torch.inference_mode():
-                output_ids = self.model.generate(**generation_kwargs)
-                htcore.mark_step()
-                torch.hpu.synchronize()
-
-            if cancel_event and cancel_event.is_set():
-                raise RequestCancelled()
-
-            finished = time.perf_counter()
-            generated_ids = output_ids[:, prompt_len:]
-            generated_tokens = int(generated_ids.shape[-1])
-            reply = self.clean_reply(self.decode(generated_ids))
-            if not reply:
-                reply = "High の推論でトークン上限に達しました。Medium に下げるか、上限を増やしてください。"
-
-            elapsed_sec = finished - started
-            ttft_sec = stopping_criteria.ttft or elapsed_sec
-            decode_sec = max(elapsed_sec - (stopping_criteria.ttft or 0.0), 1e-9)
-            tps_tokens = max(generated_tokens - 1, 0) if stopping_criteria.ttft is not None else generated_tokens
-            tokens_per_sec = tps_tokens / decode_sec
-            return ChatResponse(
-                reply=reply,
-                precision=self.precision,
-                reasoning_effort=request.reasoning_effort,
-                agent_mode=request.agent_mode,
+            if self.tensor_parallel_size > 1 and is_main_process():
+                self.broadcast_command(
+                    {
+                        "type": "generate",
+                        "request": request.model_dump(),
+                    }
+                )
+            return self._generate_loaded(
+                request,
                 sources=sources,
-                effective_max_new_tokens=self.max_new_tokens(request),
-                enable_thinking=self.enable_thinking(request),
-                elapsed_sec=elapsed_sec,
-                ttft_sec=ttft_sec,
-                tokens_per_sec=tokens_per_sec,
-                generated_tokens=generated_tokens,
+                cancel_event=cancel_event,
             )
 
     def stream_generate(
@@ -2436,6 +2712,12 @@ class ChatEngine:
         sources: list[SearchResult] | None = None,
         cancel_event: threading.Event | None = None,
     ):
+        if self.tensor_parallel_size > 1:
+            response = self.generate(request, sources=sources, cancel_event=cancel_event)
+            yield {"type": "delta", "text": response.reply}
+            yield {"type": "final", "data": response.model_dump()}
+            return
+
         sources = sources or []
         with self.lock:
             if cancel_event and cancel_event.is_set():
@@ -2452,7 +2734,8 @@ class ChatEngine:
                 for key in ("input_ids", "attention_mask"):
                     if key in inputs:
                         inputs[key] = inputs[key].to(dtype=torch.int32)
-            inputs = {key: value.to("hpu") for key, value in inputs.items()}
+            torch.hpu.set_device(self.device)
+            inputs = {key: value.to(self.device) for key, value in inputs.items()}
 
             prompt_len = inputs["input_ids"].shape[-1]
             do_sample = request.temperature > 0
@@ -2481,6 +2764,7 @@ class ChatEngine:
 
             def run_generate() -> None:
                 try:
+                    torch.hpu.set_device(self.device)
                     with torch.inference_mode():
                         generated_output["output_ids"] = self.model.generate(**generation_kwargs)
                         htcore.mark_step()
@@ -2588,8 +2872,8 @@ def package_version(name: str) -> str:
         return "not installed"
 
 
-def create_app(model_id: str) -> FastAPI:
-    engine = ChatEngine(model_id)
+def create_app(model_id: str, tensor_parallel_size: int = 1) -> FastAPI:
+    engine = ChatEngine(model_id, tensor_parallel_size=tensor_parallel_size)
     history_store = HistoryStore(HISTORY_PATH)
     progress_lock = threading.Lock()
     agent_progress: dict[str, dict] = {}
@@ -2699,6 +2983,9 @@ def create_app(model_id: str) -> FastAPI:
         print(f"optimum-habana={package_version('optimum-habana')}", flush=True)
         print(f"transformers={package_version('transformers')}", flush=True)
         print(f"default_model_id={engine.default_model_id}", flush=True)
+        preload_model_ids = engine.preload_order(list(supported_model_specs()))
+        print(f"Preloading models at startup: {', '.join(preload_model_ids)}", flush=True)
+        engine.preload(preload_model_ids)
         yield
 
     app = FastAPI(title="Gaudi Qwen Chat", lifespan=lifespan)
@@ -2790,11 +3077,6 @@ def create_app(model_id: str) -> FastAPI:
                 f"mode={chat_request.agent_mode}, model={chat_request.model_id}",
                 flush=True,
             )
-            if engine.is_loaded and engine.active_model_id != chat_request.model_id:
-                raise RuntimeError(
-                    "Select the model in the UI first. The server restarts to switch models cleanly."
-                )
-
             cursor = 1
             sources: list[SearchResult] = []
             resolved_mode, search_decision = resolve_agent_mode(chat_request)
@@ -2833,8 +3115,7 @@ def create_app(model_id: str) -> FastAPI:
             set_fallback_step(job_id, steps, cursor, "done", "生成用プロンプトを作成")
             cursor += 1
 
-            detail = "モデルをロードして生成しています" if not engine.is_loaded else "HPU 上のモデルで生成しています"
-            set_fallback_step(job_id, steps, cursor, "active", detail)
+            set_fallback_step(job_id, steps, cursor, "active", "HPU 上のモデルで生成しています")
             response = engine.generate(enriched_request, sources=sources)
             set_fallback_step(job_id, steps, cursor, "done", "生成が完了しました")
             cursor += 1
@@ -2944,8 +3225,17 @@ def create_app(model_id: str) -> FastAPI:
             "hpu_execution_mode": HPU_EXECUTION_MODE,
             "use_int32_inputs": USE_INT32_INPUTS,
             "model_placement": MODEL_PLACEMENT,
+            "tensor_parallel_size": engine.tensor_parallel_size,
+            "rank": get_rank(),
+            "world_size": get_world_size(),
             "active_model_id": engine.active_model_id,
+            "active_device": engine.device,
             "model_loaded": engine.is_loaded,
+            "loaded_model_ids": list(engine.loaded_models),
+            "loaded_model_devices": {
+                model_id: str(state.get("device", "hpu"))
+                for model_id, state in engine.loaded_models.items()
+            },
             "precision": engine.precision,
             "fp8_enabled": engine.precision.startswith("fp8"),
             "hpu_available": None,
@@ -3053,8 +3343,6 @@ def create_app(model_id: str) -> FastAPI:
         search_decision = ""
         sources: list[SearchResult] = []
         try:
-            if engine.is_loaded and engine.active_model_id != request.model_id:
-                raise RuntimeError("Select the model in the UI first. The server restarts to switch models cleanly.")
             cursor = 1
             resolved_mode, search_decision = resolve_agent_mode(request)
             if request.agent_mode == "auto":
@@ -3185,11 +3473,6 @@ def create_app(model_id: str) -> FastAPI:
         resolved_mode = "chat"
         search_decision = ""
         try:
-            if engine.is_loaded and engine.active_model_id != request.model_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Select the model in the UI first. The server restarts to switch models cleanly.",
-                )
             cursor = 1
             resolved_mode, search_decision = resolve_agent_mode(request)
             if request.agent_mode == "auto":
@@ -3282,15 +3565,6 @@ def create_app(model_id: str) -> FastAPI:
         set_progress_thread(request_id, request.user_id, request.thread_id)
         steps = initial_steps(request.agent_mode)
         set_steps(request_id, steps)
-        try:
-            if engine.is_loaded and engine.active_model_id != request.model_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Select the model in the UI first. The server restarts to switch models cleanly.",
-                )
-        except HTTPException:
-            update_step(request_id, steps, len(steps) - 1, "error", "リクエストを完了できませんでした", done=True)
-            raise
 
         def line(event: dict) -> str:
             return json.dumps(event, ensure_ascii=False) + "\n"
@@ -3384,21 +3658,6 @@ def create_app(model_id: str) -> FastAPI:
                 update_step(request_id, steps, cursor, "active", "HPU 上のモデルで生成しています")
                 print(f"Generation start: request_id={request_id}, mode={request.agent_mode}", flush=True)
                 yield status_event("モデル生成中です")
-                if not engine.is_loaded or engine.active_model_id != enriched_request.model_id:
-                    update_step(
-                        request_id,
-                        steps,
-                        cursor,
-                        "active",
-                        f"初回モデルロード中です: {enriched_request.model_id}",
-                    )
-                    print(
-                        f"Model load pending before generation: request_id={request_id}, "
-                        f"model={enriched_request.model_id}",
-                        flush=True,
-                    )
-                    yield status_event(f"初回モデルロード中です: {enriched_request.model_id}")
-
                 for event in engine.stream_generate(enriched_request, sources=sources, cancel_event=cancel_event):
                     if event["type"] == "final":
                         response = ChatResponse(**event["data"])
@@ -3461,40 +3720,21 @@ def create_app(model_id: str) -> FastAPI:
     def switch_model(request: SwitchModelRequest) -> dict:
         if request.model_id not in supported_model_specs():
             raise HTTPException(status_code=400, detail=f"Unsupported model: {request.model_id}")
-        if not engine.is_loaded:
-            engine.default_model_id = request.model_id
-            return {
-                "restarting": False,
-                "active_model_id": None,
-                "default_model_id": engine.default_model_id,
-            }
-        if engine.is_loaded and engine.active_model_id == request.model_id:
-            engine.default_model_id = request.model_id
-            return {
-                "restarting": False,
-                "active_model_id": engine.active_model_id,
-                "default_model_id": engine.default_model_id,
-            }
-
-        def restart() -> None:
-            env = os.environ.copy()
-            env["MODEL_ID"] = request.model_id
-            env["SERVER_HOST"] = SERVER_HOST
-            env["SERVER_PORT"] = str(SERVER_PORT)
-            args = [
-                sys.executable,
-                os.path.abspath(__file__),
-                "--host",
-                SERVER_HOST,
-                "--port",
-                str(SERVER_PORT),
-                "--model-id",
-                request.model_id,
-            ]
-            os.execve(sys.executable, args, env)
-
-        threading.Timer(0.5, restart).start()
-        return {"restarting": True, "target_model_id": request.model_id}
+        with engine.lock:
+            if request.model_id not in engine.loaded_models:
+                raise HTTPException(status_code=503, detail=f"Model is not loaded: {request.model_id}")
+            engine.activate(request.model_id)
+        return {
+            "restarting": False,
+            "active_model_id": engine.active_model_id,
+            "default_model_id": engine.default_model_id,
+            "loaded_model_ids": list(engine.loaded_models),
+            "active_device": engine.device,
+            "loaded_model_devices": {
+                model_id: str(state.get("device", "hpu"))
+                for model_id, state in engine.loaded_models.items()
+            },
+        }
 
     return app
 
@@ -3504,12 +3744,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id", default=os.environ.get("MODEL_ID", DEFAULT_MODEL_ID), choices=sorted(supported_model_specs()))
     parser.add_argument("--host", default=os.environ.get("SERVER_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=None)
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=int(os.environ.get("CHAT_TENSOR_PARALLEL_SIZE", "1")),
+        help="Number of torchrun HPU processes to use for Transformers tensor parallel.",
+    )
     args = parser.parse_args()
     args.port = args.port or int(os.environ.get("SERVER_PORT", DEFAULT_SERVER_PORT))
     return args
 
 
-app = create_app(os.environ.get("MODEL_ID", DEFAULT_MODEL_ID))
+app = create_app(
+    os.environ.get("MODEL_ID", DEFAULT_MODEL_ID),
+    tensor_parallel_size=int(os.environ.get("CHAT_TENSOR_PARALLEL_SIZE", "1")),
+)
 
 
 if __name__ == "__main__":
@@ -3518,5 +3767,10 @@ if __name__ == "__main__":
     args = parse_args()
     SERVER_HOST = args.host
     SERVER_PORT = args.port
-    app = create_app(args.model_id)
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    setup_tensor_parallel(args.tensor_parallel_size)
+    if args.tensor_parallel_size > 1 and not is_main_process():
+        engine = ChatEngine(args.model_id, tensor_parallel_size=args.tensor_parallel_size)
+        engine.worker_loop()
+    else:
+        app = create_app(args.model_id, tensor_parallel_size=args.tensor_parallel_size)
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
