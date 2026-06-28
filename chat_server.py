@@ -44,6 +44,8 @@ from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 
 COMPAT_DEFAULT_MODEL_ID = "Qwen/Qwen3-32B"
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_HF_HOME = PROJECT_ROOT / "hf_cache"
 
 
 def transformer_supports_model_type(model_type: str) -> bool:
@@ -62,6 +64,8 @@ HPU_EXECUTION_MODE = "lazy" if os.environ.get("PT_HPU_LAZY_MODE") == "1" else "e
 USE_INT32_INPUTS = os.environ.get("USE_INT32_INPUTS", "1") == "1"
 MODEL_PLACEMENT = "single_hpu_transformers"
 OPTIMUM_HABANA_ENABLED: bool | None = None
+MODEL_LOCAL_FILES_ONLY = os.environ.get("CHAT_MODEL_LOCAL_FILES_ONLY", "1") != "0"
+HF_MODEL_REVISION = os.environ.get("HF_MODEL_REVISION", "main")
 MODEL_SPECS = {
     "Qwen/Qwen3-32B": {
         "label": "Qwen3 32B",
@@ -101,6 +105,51 @@ def resolve_execution_model_id(model_id: str) -> str:
         )
         return fallback_model_id
     return model_id
+
+
+def hf_cache_root() -> Path:
+    if os.environ.get("HF_HUB_CACHE"):
+        return Path(os.environ["HF_HUB_CACHE"]).expanduser()
+    if os.environ.get("HF_HOME"):
+        return Path(os.environ["HF_HOME"]).expanduser() / "hub"
+    return DEFAULT_HF_HOME / "hub"
+
+
+def hf_model_cache_name(model_id: str) -> str:
+    return f"models--{model_id.replace('/', '--')}"
+
+
+def local_snapshot_path(model_id: str, revision: str = HF_MODEL_REVISION) -> Path | None:
+    model_dir = hf_cache_root() / hf_model_cache_name(model_id)
+    ref_path = model_dir / "refs" / revision
+    if ref_path.exists():
+        snapshot_revision = ref_path.read_text(encoding="utf-8").strip()
+        snapshot_path = model_dir / "snapshots" / snapshot_revision
+        if snapshot_revision and snapshot_path.exists():
+            return snapshot_path
+
+    snapshots_dir = model_dir / "snapshots"
+    if not snapshots_dir.exists():
+        return None
+    snapshots = sorted(snapshots_dir.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True)
+    return snapshots[0] if snapshots else None
+
+
+def resolve_pretrained_source(model_id: str) -> tuple[str, dict[str, object]]:
+    if not MODEL_LOCAL_FILES_ONLY:
+        return model_id, {"revision": HF_MODEL_REVISION}
+
+    snapshot_path = local_snapshot_path(model_id)
+    if snapshot_path is None:
+        raise RuntimeError(
+            f"Local snapshot for {model_id} was not found in {hf_cache_root()}. "
+            "Download it first with: "
+            f"{sys.executable} download_hf_models.py "
+            f"--model-id {model_id} --prepare"
+        )
+
+    print(f"Using local Hugging Face snapshot: {snapshot_path}", flush=True)
+    return str(snapshot_path), {"local_files_only": True}
 
 
 REASONING_PRESETS = {
@@ -2222,11 +2271,12 @@ class ChatEngine:
             f"kind={spec['kind']}, precision={spec['precision']}",
             flush=True,
         )
+        pretrained_source, pretrained_kwargs = resolve_pretrained_source(execution_model_id)
         if spec["kind"] == "image_text":
-            tokenizer = AutoProcessor.from_pretrained(execution_model_id)
+            tokenizer = AutoProcessor.from_pretrained(pretrained_source, **pretrained_kwargs)
             model_cls = AutoModelForImageTextToText
         else:
-            tokenizer = AutoTokenizer.from_pretrained(execution_model_id)
+            tokenizer = AutoTokenizer.from_pretrained(pretrained_source, **pretrained_kwargs)
             model_cls = AutoModelForCausalLM
 
         if is_fp8_model(execution_model_id):
@@ -2236,8 +2286,9 @@ class ChatEngine:
         else:
             model_kwargs = {"torch_dtype": torch.bfloat16}
         self.model = model_cls.from_pretrained(
-            execution_model_id,
+            pretrained_source,
             **model_kwargs,
+            **pretrained_kwargs,
             low_cpu_mem_usage=True,
             device_map={"": "hpu"},
         )

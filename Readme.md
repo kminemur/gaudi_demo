@@ -9,27 +9,44 @@ Run Qwen models on Intel Gaudi HPU. The chat server defaults to
 
 ## Model download script
 
-Use the dedicated script to pre-download model snapshots into Hugging Face cache.
+Use the dedicated script to pre-download and verify model snapshots before
+starting the chat server. This keeps the UI from appearing stuck while large
+model shards are still being fetched. If `HF_HOME` is not set, the script uses
+this repository's `./hf_cache` directory by default.
 
-Download all demo default models:
+Prepare all demo default models:
 
 ```bash
-HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python download_hf_models.py --all-defaults
+/home/test1/habanalabs-venv-optimum/bin/python download_hf_models.py \
+  --all-defaults \
+  --prepare
 ```
 
-Download specific models only:
+Prepare specific models only:
 
 ```bash
-HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python download_hf_models.py \
+/home/test1/habanalabs-venv-optimum/bin/python download_hf_models.py \
   --model-id Qwen/Qwen3-32B \
-  --model-id Qwen/Qwen3-235B-A22B
+  --model-id Qwen/Qwen3-235B-A22B \
+  --prepare
 ```
 
 If authentication is required, set a token:
 
 ```bash
-HF_TOKEN=<your_token> HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python download_hf_models.py \
-  --model-id Qwen/Qwen3-235B-A22B
+HF_TOKEN=<your_token> /home/test1/habanalabs-venv-optimum/bin/python download_hf_models.py \
+  --model-id Qwen/Qwen3-235B-A22B \
+  --prepare
+```
+
+If a previous download was interrupted, `--prepare` removes stale
+`*.incomplete` blob files for the selected models and verifies the final local
+snapshot. To check the cache without downloading:
+
+```bash
+/home/test1/habanalabs-venv-optimum/bin/python download_hf_models.py \
+  --all-defaults \
+  --verify-only
 ```
 
 ## Chat UI
@@ -41,6 +58,12 @@ default:
 HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python chat_server.py \
   --host 0.0.0.0
 ```
+
+By default, `chat_server.py` loads models from the already-downloaded local
+Hugging Face snapshot and does not download missing files at startup. To allow
+the server to download from Hugging Face, set `CHAT_MODEL_LOCAL_FILES_ONLY=0`.
+If `HF_HOME` is not set, the server also uses this repository's `./hf_cache`
+directory by default.
 
 Then open `http://<server-ip>:8000/`.
 
