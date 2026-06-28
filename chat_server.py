@@ -150,9 +150,13 @@ def tensor_parallel_config(pretrained_source: str, pretrained_kwargs: dict[str, 
         plan = dict(getattr(config, "base_model_tp_plan", {}) or {})
         plan["layers.*.self_attn.k_proj"] = "replicate"
         plan["layers.*.self_attn.v_proj"] = "replicate"
+        plan["layers.*.mlp.experts.*.gate_proj"] = "local_colwise"
+        plan["layers.*.mlp.experts.*.up_proj"] = "local_colwise"
+        plan["layers.*.mlp.experts.*.down_proj"] = "local_rowwise"
         config.base_model_tp_plan = plan
         print_main(
-            "Adjusted Qwen3 MoE TP plan: k_proj/v_proj replicated because "
+            "Adjusted Qwen3 MoE TP plan: k_proj/v_proj replicated and expert weights "
+            "kept as local shards because "
             f"tp_size={tp_size} > num_key_value_heads={config.num_key_value_heads}."
         )
     return config
@@ -2358,7 +2362,10 @@ def patch_qwen3_moe_sparse_moe_forward(modeling_qwen3_moe) -> None:
 
     def forward_with_local_expert_shards(self, hidden_states: torch.Tensor):
         first_weight = self.experts[0].gate_proj.weight
-        if not hasattr(first_weight, "to_local"):
+        expert_weights_are_sharded = (
+            hasattr(first_weight, "to_local") or first_weight.shape[0] != self.moe_intermediate_size
+        )
+        if not expert_weights_are_sharded:
             return original_forward(self, hidden_states)
 
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -2380,18 +2387,18 @@ def patch_qwen3_moe_sparse_moe_forward(modeling_qwen3_moe) -> None:
         )
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
         expert_hits = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero().flatten().tolist()
-        used_dtensor_weights = hidden_was_dtensor
+        used_parallel_weights = hidden_was_dtensor or expert_weights_are_sharded
         for expert_index in expert_hits:
             expert_layer = self.experts[expert_index]
             idx, top_x = torch.where(expert_mask[expert_index].squeeze(0))
             current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
 
             gate_weight, used_dtensor = local_tensor(expert_layer.gate_proj.weight)
-            used_dtensor_weights = used_dtensor_weights or used_dtensor
+            used_parallel_weights = used_parallel_weights or used_dtensor
             up_weight, used_dtensor = local_tensor(expert_layer.up_proj.weight)
-            used_dtensor_weights = used_dtensor_weights or used_dtensor
+            used_parallel_weights = used_parallel_weights or used_dtensor
             down_weight, used_dtensor = local_tensor(expert_layer.down_proj.weight)
-            used_dtensor_weights = used_dtensor_weights or used_dtensor
+            used_parallel_weights = used_parallel_weights or used_dtensor
 
             current_hidden_states = torch.nn.functional.silu(
                 torch.nn.functional.linear(current_state, gate_weight)
@@ -2400,7 +2407,7 @@ def patch_qwen3_moe_sparse_moe_forward(modeling_qwen3_moe) -> None:
             current_hidden_states = current_hidden_states * routing_weights[top_x, idx, None]
             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
 
-        if used_dtensor_weights and dist.is_available() and dist.is_initialized():
+        if used_parallel_weights and dist.is_available() and dist.is_initialized():
             dist.all_reduce(final_hidden_states, op=dist.ReduceOp.SUM)
         htcore.mark_step()
 
