@@ -2293,9 +2293,122 @@ def enable_optimum_habana() -> bool:
         return False
 
     adapt_transformers_to_gaudi()
+    patch_qwen3_moe_tensor_parallel_attention()
     print("Optimum Habana Gaudi patches enabled.", flush=True)
     OPTIMUM_HABANA_ENABLED = True
     return True
+
+
+def patch_qwen3_moe_tensor_parallel_attention() -> None:
+    try:
+        from optimum.habana.transformers.models.qwen3_moe import modeling_qwen3_moe
+    except Exception as error:
+        print(f"Qwen3 MoE attention patch skipped: {error}", flush=True)
+        return
+
+    if getattr(modeling_qwen3_moe, "_CHAT_SERVER_TP_REPEAT_KV_PATCHED", False):
+        return
+
+    def repeat_kv_for_local_query_heads(
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        n_rep: int,
+    ):
+        batch, num_key_value_heads, kv_len, head_dim = key_states.shape
+        query_heads = query_states.shape[1]
+        if n_rep == 1 or num_key_value_heads == 1:
+            return query_states, key_states, value_states, attention_mask
+        if query_heads % num_key_value_heads != 0:
+            raise RuntimeError(
+                f"Qwen3 MoE TP attention requires local query heads divisible by KV heads: "
+                f"query_heads={query_heads}, num_key_value_heads={num_key_value_heads}"
+            )
+
+        local_n_rep = query_heads // num_key_value_heads
+        key_states = key_states.reshape((batch, num_key_value_heads, 1, kv_len, head_dim))
+        value_states = value_states.reshape((batch, num_key_value_heads, 1, kv_len, head_dim))
+
+        batch, _, q_len, head_dim = query_states.shape
+        query_states = query_states.reshape((batch, num_key_value_heads, local_n_rep, q_len, head_dim))
+
+        if attention_mask is not None:
+            attention_mask = attention_mask.unsqueeze(1)
+
+        return query_states, key_states, value_states, attention_mask
+
+    modeling_qwen3_moe.gaudi_qwen3moe_repeat_kv = repeat_kv_for_local_query_heads
+    patch_qwen3_moe_sparse_moe_forward(modeling_qwen3_moe)
+    modeling_qwen3_moe._CHAT_SERVER_TP_REPEAT_KV_PATCHED = True
+    print_main("Patched Qwen3 MoE tensor-parallel attention and sparse MoE fallback.")
+
+
+def patch_qwen3_moe_sparse_moe_forward(modeling_qwen3_moe) -> None:
+    block_cls = getattr(modeling_qwen3_moe, "GaudiQwen3MoeSparseMoeBlock", None)
+    if block_cls is None or getattr(block_cls, "_CHAT_SERVER_TP_MOE_PATCHED", False):
+        return
+
+    original_forward = block_cls.forward
+
+    def local_tensor(tensor):
+        if hasattr(tensor, "to_local"):
+            return tensor.to_local(), True
+        return tensor, False
+
+    def forward_with_local_expert_shards(self, hidden_states: torch.Tensor):
+        first_weight = self.experts[0].gate_proj.weight
+        if not hasattr(first_weight, "to_local"):
+            return original_forward(self, hidden_states)
+
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states, hidden_was_dtensor = local_tensor(hidden_states)
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        router_logits = self.gate(hidden_states)
+        routing_weights = torch.nn.functional.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+
+        if self.norm_topk_prob:
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        expert_hits = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero().flatten().tolist()
+        used_dtensor_weights = hidden_was_dtensor
+        for expert_index in expert_hits:
+            expert_layer = self.experts[expert_index]
+            idx, top_x = torch.where(expert_mask[expert_index].squeeze(0))
+            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+
+            gate_weight, used_dtensor = local_tensor(expert_layer.gate_proj.weight)
+            used_dtensor_weights = used_dtensor_weights or used_dtensor
+            up_weight, used_dtensor = local_tensor(expert_layer.up_proj.weight)
+            used_dtensor_weights = used_dtensor_weights or used_dtensor
+            down_weight, used_dtensor = local_tensor(expert_layer.down_proj.weight)
+            used_dtensor_weights = used_dtensor_weights or used_dtensor
+
+            current_hidden_states = torch.nn.functional.silu(
+                torch.nn.functional.linear(current_state, gate_weight)
+            ) * torch.nn.functional.linear(current_state, up_weight)
+            current_hidden_states = torch.nn.functional.linear(current_hidden_states, down_weight)
+            current_hidden_states = current_hidden_states * routing_weights[top_x, idx, None]
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+
+        if used_dtensor_weights and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(final_hidden_states, op=dist.ReduceOp.SUM)
+        htcore.mark_step()
+
+        final_hidden_states = final_hidden_states.reshape(-1, sequence_length, hidden_dim)
+        return final_hidden_states, router_logits
+
+    block_cls.forward = forward_with_local_expert_shards
+    block_cls._CHAT_SERVER_TP_MOE_PATCHED = True
 
 
 class ChatEngine:
@@ -2677,7 +2790,7 @@ class ChatEngine:
         torch.hpu.synchronize()
         started = time.perf_counter()
         stopping_criteria.start()
-        with torch.inference_mode():
+        with torch.no_grad():
             output_ids = self.model.generate(**generation_kwargs)
             htcore.mark_step()
             torch.hpu.synchronize()
@@ -2798,7 +2911,7 @@ class ChatEngine:
             def run_generate() -> None:
                 try:
                     self.set_active_hpu_device()
-                    with torch.inference_mode():
+                    with torch.no_grad():
                         generated_output["output_ids"] = self.model.generate(**generation_kwargs)
                         htcore.mark_step()
                         torch.hpu.synchronize()
