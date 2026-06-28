@@ -526,7 +526,7 @@ HTML = """<!doctype html>
       border-top: 1px solid var(--line);
       padding: 14px;
       display: grid;
-      grid-template-columns: minmax(220px, 300px) minmax(0, 1fr) auto;
+      grid-template-columns: minmax(220px, 300px) minmax(0, 1fr) auto auto;
       gap: 10px;
       align-items: end;
       background: #fbfbf9;
@@ -702,6 +702,7 @@ HTML = """<!doctype html>
           </div>
           <textarea id="prompt" name="prompt" autocomplete="off" placeholder="メッセージを入力" autofocus></textarea>
           <button id="send" type="submit">送信</button>
+          <button id="cancelJob" class="cancel hidden" type="button">キャンセル</button>
         </form>
       </main>
     </div>
@@ -712,6 +713,7 @@ HTML = """<!doctype html>
     const form = document.querySelector("#chatForm");
     const promptEl = document.querySelector("#prompt");
     const sendEl = document.querySelector("#send");
+    const cancelJobEl = document.querySelector("#cancelJob");
     const modelEl = document.querySelector("#model");
     const reasoningEl = document.querySelector("#reasoning");
     const agentModeEl = document.querySelector("#agentMode");
@@ -737,6 +739,7 @@ HTML = """<!doctype html>
     const activityElapsedEl = document.querySelector("#activityElapsed");
     const chatHistory = [];
     const defaultSystemMessage = "選択した Qwen モデルが Intel Gaudi HPU 上で応答します。";
+    const activeRequestIds = new Set();
     let activeRequestId = null;
     let activeController = null;
     let isRunning = false;
@@ -769,12 +772,31 @@ HTML = """<!doctype html>
 
     async function cancelActiveRequest() {
       if (!activeRequestId) return;
-      sendEl.disabled = true;
+      cancelJobEl.disabled = true;
+      cancelJobEl.textContent = "キャンセル中";
       setStatus("cancelling", "busy");
       try {
         await fetch(`/api/cancel/${encodeURIComponent(activeRequestId)}`, { method: "POST" });
       } catch (_error) {}
       if (activeController) activeController.abort();
+    }
+
+    function updateCancelButton() {
+      const requestIds = Array.from(activeRequestIds);
+      activeRequestId = requestIds.length ? requestIds[requestIds.length - 1] : null;
+      cancelJobEl.classList.toggle("hidden", !activeRequestId);
+      cancelJobEl.disabled = false;
+      cancelJobEl.textContent = "キャンセル";
+    }
+
+    function trackActiveRequest(requestId) {
+      activeRequestIds.add(requestId);
+      updateCancelButton();
+    }
+
+    function untrackActiveRequest(requestId) {
+      activeRequestIds.delete(requestId);
+      updateCancelButton();
     }
 
     function setStatus(text, state) {
@@ -1098,6 +1120,7 @@ HTML = """<!doctype html>
       const assistantNode = addMessage("assistant", "キューに追加しています...");
       const stepsNode = addStepPanel();
       renderSteps(stepsNode, clientInitialSteps(agentModeEl.value));
+      trackActiveRequest(requestId);
 
       try {
         const res = await fetch("/api/chat/jobs", {
@@ -1148,9 +1171,10 @@ HTML = """<!doctype html>
             lastJobUpdatedAt = job.updated_at || 0;
             if (!job.done) return;
             clearInterval(poll);
+            untrackActiveRequest(requestId);
             if (job.error) {
-              assistantNode.textContent = `エラー: ${job.error}`;
-              setStatus("error", "");
+              assistantNode.textContent = job.error === "Request cancelled" ? "キャンセルしました。" : `エラー: ${job.error}`;
+              setStatus(job.error === "Request cancelled" ? "ready" : "error", job.error === "Request cancelled" ? "ready" : "");
               return;
             }
             const finalData = job.response;
@@ -1164,6 +1188,7 @@ HTML = """<!doctype html>
             setStatus("ready", "ready");
           } catch (error) {
             clearInterval(poll);
+            untrackActiveRequest(requestId);
             assistantNode.textContent = `エラー: ${error.message}`;
             setStatus("error", "");
           }
@@ -1171,6 +1196,7 @@ HTML = """<!doctype html>
 
         setStatus("ready", "ready");
       } catch (error) {
+        untrackActiveRequest(requestId);
         assistantNode.textContent = `エラー: ${error.message}`;
         setStatus("error", "");
         finishActivity(`エラー: ${error.message}`);
@@ -1181,6 +1207,8 @@ HTML = """<!doctype html>
         promptEl.focus();
       }
     });
+
+    cancelJobEl.addEventListener("click", cancelActiveRequest);
 
     modelEl.addEventListener("change", () => {
       addMessage("system", `${modelEl.value} に切り替えます。初回応答時にモデルをロードします。`);
@@ -1290,7 +1318,7 @@ def split_html_script() -> tuple[str, str]:
     start = HTML.index(script_open)
     end = HTML.index(script_close, start)
     script = HTML[start + len(script_open) : end].strip()
-    shell = HTML[:start] + '  <script src="/app.js?v=8" defer></script>\n' + HTML[end + len(script_close) :]
+    shell = HTML[:start] + '  <script src="/app.js?v=9" defer></script>\n' + HTML[end + len(script_close) :]
     return shell, script
 
 
