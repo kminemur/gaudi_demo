@@ -51,12 +51,11 @@ snapshot. To check the cache without downloading:
 
 ## Chat UI
 
-Start a web chat server bound to all interfaces. The server uses port `8000` by
-default:
+Start the 235B tensor-parallel chat server bound to all interfaces. The server
+uses port `8000` by default:
 
 ```bash
-HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python chat_server.py \
-  --host 0.0.0.0
+./start_chat_server.sh
 ```
 
 By default, `chat_server.py` loads models from the already-downloaded local
@@ -69,17 +68,11 @@ Then open `http://<server-ip>:8000/`.
 
 You can override the default with `SERVER_PORT` or `--port`.
 
-For the 235B chat server on 8 Gaudi HPUs, start it with tensor parallel. Rank 0
-serves HTTP; the other ranks participate in model generation:
+The script defaults to 8 Gaudi HPU processes. Override settings with
+environment variables:
 
 ```bash
-PATH=/home/test1/habanalabs-venv-optimum/bin:$PATH \
-HF_HOME=$PWD/hf_cache \
-/home/test1/habanalabs-venv-optimum/bin/python -m torch.distributed.run \
-  --standalone --nproc_per_node=8 \
-  chat_server.py \
-  --host 0.0.0.0 \
-  --tensor-parallel-size 8
+SERVER_PORT=8080 CHAT_TENSOR_PARALLEL_SIZE=8 ./start_chat_server.sh
 ```
 
 To keep the server running in the background after closing the terminal, start it

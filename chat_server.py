@@ -102,6 +102,13 @@ def get_world_size() -> int:
     return int(os.environ.get("WORLD_SIZE", "1"))
 
 
+def default_tensor_parallel_size() -> int:
+    if os.environ.get("CHAT_TENSOR_PARALLEL_SIZE"):
+        return int(os.environ["CHAT_TENSOR_PARALLEL_SIZE"])
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    return world_size if world_size > 1 else 1
+
+
 def is_main_process() -> bool:
     return get_rank() == 0
 
@@ -129,12 +136,26 @@ def setup_tensor_parallel(tensor_parallel_size: int) -> None:
             f"--tensor-parallel-size={tensor_parallel_size} requested, but only "
             f"{torch.hpu.device_count()} HPU devices are available."
         )
-    if dist.is_available() and not dist.is_initialized():
-        dist.init_process_group(backend="hccl", rank=get_rank(), world_size=world_size)
+    # Transformers initializes the HCCL process group for tp_plan="auto".
+    # Pre-initializing it here can conflict with device-mesh setup on Gaudi.
 
 
 def get_tensor_parallel_plan(model_id: str) -> str | dict[str, str]:
     return "auto"
+
+
+def tensor_parallel_config(pretrained_source: str, pretrained_kwargs: dict[str, object], tp_size: int):
+    config = AutoConfig.from_pretrained(pretrained_source, **pretrained_kwargs)
+    if getattr(config, "model_type", "") == "qwen3_moe" and tp_size > getattr(config, "num_key_value_heads", tp_size):
+        plan = dict(getattr(config, "base_model_tp_plan", {}) or {})
+        plan["layers.*.self_attn.k_proj"] = "replicate"
+        plan["layers.*.self_attn.v_proj"] = "replicate"
+        config.base_model_tp_plan = plan
+        print_main(
+            "Adjusted Qwen3 MoE TP plan: k_proj/v_proj replicated because "
+            f"tp_size={tp_size} > num_key_value_heads={config.num_key_value_heads}."
+        )
+    return config
 
 
 def is_fp8_model(model_id: str) -> bool:
@@ -2460,8 +2481,17 @@ class ChatEngine:
             "low_cpu_mem_usage": True,
         }
         if self.tensor_parallel_size > 1:
+            load_kwargs["config"] = tensor_parallel_config(
+                pretrained_source,
+                pretrained_kwargs,
+                self.tensor_parallel_size,
+            )
             load_kwargs["tp_plan"] = get_tensor_parallel_plan(execution_model_id)
             load_kwargs["tp_size"] = self.tensor_parallel_size
+            print_main(
+                f"Using Transformers tensor parallel: tp_size={self.tensor_parallel_size}, "
+                f"tp_plan={load_kwargs['tp_plan']}"
+            )
         else:
             device_map, max_memory = self.device_map_and_memory_for_devices(
                 model_cls,
@@ -2983,7 +3013,18 @@ def create_app(model_id: str, tensor_parallel_size: int = 1) -> FastAPI:
         print(f"optimum-habana={package_version('optimum-habana')}", flush=True)
         print(f"transformers={package_version('transformers')}", flush=True)
         print(f"default_model_id={engine.default_model_id}", flush=True)
+        print(
+            f"tensor_parallel_size={engine.tensor_parallel_size}, "
+            f"rank={get_rank()}, world_size={get_world_size()}",
+            flush=True,
+        )
         preload_model_ids = engine.preload_order(list(supported_model_specs()))
+        if any("235B" in model_id for model_id in preload_model_ids) and engine.tensor_parallel_size <= 1:
+            raise RuntimeError(
+                "Qwen3-235B-A22B requires tensor parallel startup. "
+                "Run with: python -m torch.distributed.run --standalone --nproc_per_node=8 "
+                "chat_server.py --host 0.0.0.0 --tensor-parallel-size 8"
+            )
         print(f"Preloading models at startup: {', '.join(preload_model_ids)}", flush=True)
         engine.preload(preload_model_ids)
         yield
@@ -3747,7 +3788,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tensor-parallel-size",
         type=int,
-        default=int(os.environ.get("CHAT_TENSOR_PARALLEL_SIZE", "1")),
+        default=default_tensor_parallel_size(),
         help="Number of torchrun HPU processes to use for Transformers tensor parallel.",
     )
     args = parser.parse_args()
@@ -3757,7 +3798,7 @@ def parse_args() -> argparse.Namespace:
 
 app = create_app(
     os.environ.get("MODEL_ID", DEFAULT_MODEL_ID),
-    tensor_parallel_size=int(os.environ.get("CHAT_TENSOR_PARALLEL_SIZE", "1")),
+    tensor_parallel_size=default_tensor_parallel_size(),
 )
 
 

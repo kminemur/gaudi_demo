@@ -1,12 +1,13 @@
 # TP起動
 
-235Bはtorchrunで起動する。
+235Bサーバーは簡易スクリプトで起動する。
 
 ```bash
-PATH=/home/test1/habanalabs-venv-optimum/bin:$PATH \
-HF_HOME=$PWD/hf_cache \
-/home/test1/habanalabs-venv-optimum/bin/python -m torch.distributed.run \
- --standalone --nproc_per_node=8 chat_server.py \
- --host 0.0.0.0 --tensor-parallel-size 8
+./start_chat_server.sh
 ```
 
+既定は8 HPU、port 8000、`hf_cache`。変更例:
+
+```bash
+SERVER_PORT=8080 CHAT_TENSOR_PARALLEL_SIZE=8 ./start_chat_server.sh
+```
