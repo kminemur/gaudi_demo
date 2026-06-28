@@ -2441,13 +2441,16 @@ class ChatEngine:
             max_memory[device_index] = capped_memory
         return max_memory
 
+    def set_active_hpu_device(self) -> None:
+        if self.tensor_parallel_size <= 1:
+            torch.hpu.set_device(self.device)
+
     def load_model_state(self, model_id: str, devices: list[str]) -> dict[str, object]:
         self.validate_model_id(model_id)
         if not torch.hpu.is_available():
             raise RuntimeError("HPU is not available. Check Habana driver/runtime setup.")
 
         device = "hpu" if self.tensor_parallel_size > 1 else devices[0]
-        torch.hpu.set_device(device)
         htcore.hpu_inference_set_env()
         optimum_enabled = enable_optimum_habana()
         spec = MODEL_SPECS[model_id]
@@ -2563,7 +2566,7 @@ class ChatEngine:
         self.precision = str(state["precision"])
         self.loaded_at = float(state["loaded_at"])
         self.device = str(state["device"])
-        torch.hpu.set_device(self.device)
+        self.set_active_hpu_device()
         print(f"Active model switched: {model_id} on {self.device}", flush=True)
 
     def unload(self) -> None:
@@ -2653,7 +2656,7 @@ class ChatEngine:
             for key in ("input_ids", "attention_mask"):
                 if key in inputs:
                     inputs[key] = inputs[key].to(dtype=torch.int32)
-        torch.hpu.set_device(self.device)
+        self.set_active_hpu_device()
         inputs = {key: value.to(self.device) for key, value in inputs.items()}
 
         prompt_len = inputs["input_ids"].shape[-1]
@@ -2764,7 +2767,7 @@ class ChatEngine:
                 for key in ("input_ids", "attention_mask"):
                     if key in inputs:
                         inputs[key] = inputs[key].to(dtype=torch.int32)
-            torch.hpu.set_device(self.device)
+            self.set_active_hpu_device()
             inputs = {key: value.to(self.device) for key, value in inputs.items()}
 
             prompt_len = inputs["input_ids"].shape[-1]
@@ -2794,7 +2797,7 @@ class ChatEngine:
 
             def run_generate() -> None:
                 try:
-                    torch.hpu.set_device(self.device)
+                    self.set_active_hpu_device()
                     with torch.inference_mode():
                         generated_output["output_ids"] = self.model.generate(**generation_kwargs)
                         htcore.mark_step()
