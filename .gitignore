@@ -1,4 +1,5 @@
 .venv/
+.deps/
 hf_cache/
 habanalabs-installer-log/
 hqt_output/

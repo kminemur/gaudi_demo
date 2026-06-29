@@ -138,11 +138,47 @@ the selected one on the next chat request.
 The chat server exposes only `Qwen/Qwen3-32B` and `Qwen/Qwen3-235B-A22B` in the
 model selector.
 
+## vLLM Gaudi inference
+
+Build vLLM and the Intel Gaudi hardware plugin from source. The script follows
+the `vllm-project/vllm-gaudi` flow: it resolves the plugin's last verified vLLM
+commit, installs vLLM with `VLLM_TARGET_DEVICE=empty`, then installs
+`vllm-gaudi`.
+
+```bash
+PYTHON_BIN=/home/test1/habanalabs-venv/bin/python ./scripts/build_vllm_gaudi.sh
+```
+
+Start the CLI chat bot with a selected model. The model is loaded once, then
+each chat turn prints TTFT and TPS metrics:
+
+```bash
+MODEL_ID=Qwen/Qwen3-235B-A22B \
+VLLM_TP_SIZE=8 \
+./start_vllm_gaudi_infer.sh
+```
+
+Inside the chat, use `/reset` to clear history and `/exit` to quit. To run a
+single prompt and exit, pass `--once`:
+
+```bash
+MODEL_ID=Qwen/Qwen3-32B \
+PROMPT="日本語で短く自己紹介して" \
+./start_vllm_gaudi_infer.sh --once
+```
+
+The vLLM CLI defaults to local Hugging Face snapshots under `./hf_cache`. To let
+vLLM download missing model files, pass `--no-local-files-only`:
+
+```bash
+MODEL_ID=Qwen/Qwen3-32B ./start_vllm_gaudi_infer.sh --no-local-files-only
+```
+
 ## Performance notes
 
-The built-in FastAPI server uses Transformers directly on a single HPU. On an
-8-card Gaudi2 host this leaves the other HPUs idle; use vLLM for Intel Gaudi or
-DeepSpeed/Optimum Habana tensor parallel inference for production throughput.
+The built-in FastAPI server still uses the Transformers tensor-parallel path.
+Use `vllm_gaudi_infer.py` for the first vLLM Gaudi inference path; the UI server
+can be switched to vLLM after this path is validated on the target model.
 
 The server enables Habana inference settings, int32 token inputs, and KV cache
 explicitly, but the main remaining bottleneck is the single-HPU Transformers
