@@ -3,16 +3,22 @@ set -euo pipefail
 
 PYTHON="${PYTHON:-python3}"
 DEPS="${DEPS:-$PWD/.deps}"
-VERSION="${VERSION:-v0.24.0}"
 
 TORCH_VERSION=$(TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$PYTHON" -c '
 import torch
 assert torch.version.cuda is None, f"CUDA PyTorch {torch.__version__} is installed"
-assert torch.__version__.startswith("2.11."), f"PyTorch 2.11 is required: {torch.__version__}"
 import re
 print(re.match(r"\d+\.\d+\.\d+", torch.__version__).group())
-' || { echo "Use the Gaudi Software 1.24.1 Python environment." >&2; exit 1; })
+' || { echo "Use an Intel Gaudi Python environment." >&2; exit 1; })
 "$PYTHON" -c 'import torch, habana_frameworks.torch; assert torch.hpu.is_available()'
+
+case "$TORCH_VERSION" in
+  2.10.*) DEFAULT_VERSION=v0.19.1 ;;
+  2.11.*) DEFAULT_VERSION=v0.24.0 ;;
+  *) echo "Unsupported PyTorch: $TORCH_VERSION" >&2; exit 1 ;;
+esac
+VERSION="${VERSION:-$DEFAULT_VERSION}"
+echo "Using vLLM Gaudi $VERSION with PyTorch $TORCH_VERSION"
 
 CONSTRAINTS=$(mktemp)
 trap 'rm -f "$CONSTRAINTS"' EXIT
