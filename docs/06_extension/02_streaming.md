@@ -1,4 +1,0 @@
-# Streaming拡張
-
-TP環境ではrank同期が重要。ストリーミングを復活させる場合、全rankが同じgenerateを継続し、rank0だけがdeltaをUIへ送る。キャンセル時も全rankへ停止コマンドをbroadcastする。
-

@@ -1,8 +1,5 @@
-.venv/
 .deps/
+.venv/
 hf_cache/
-habanalabs-installer-log/
-hqt_output/
-chat_history.json
 __pycache__/
 *.pyc
