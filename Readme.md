@@ -58,11 +58,13 @@ uses port `8000` by default:
 ./start_chat_server.sh
 ```
 
-By default, `chat_server.py` loads models from the already-downloaded local
-Hugging Face snapshot and does not download missing files at startup. To allow
-the server to download from Hugging Face, set `CHAT_MODEL_LOCAL_FILES_ONLY=0`.
-If `HF_HOME` is not set, the server also uses this repository's `./hf_cache`
-directory by default.
+Before starting torchrun, `start_chat_server.sh` verifies the selected model in
+the local Hugging Face cache and downloads it once if it is missing. Set
+`HF_TOKEN` when the model requires authentication. To disable this preparation
+after provisioning the cache separately, set `CHAT_MODEL_AUTO_PREPARE=0`.
+Direct `chat_server.py` launches remain local-files-only unless
+`CHAT_MODEL_LOCAL_FILES_ONLY=0` is set. If `HF_HOME` is not set, both paths use
+this repository's `./hf_cache` directory by default.
 
 Then open `http://<server-ip>:8000/`.
 

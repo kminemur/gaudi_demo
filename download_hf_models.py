@@ -78,6 +78,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ensure",
+        action="store_true",
+        help=(
+            "Use a complete local snapshot when available; otherwise download "
+            "and verify it. Intended for server startup."
+        ),
+    )
+    parser.add_argument(
         "--clean-incomplete",
         action="store_true",
         help="Remove *.incomplete blob files for the selected models before downloading.",
@@ -246,6 +254,12 @@ def main() -> int:
             print(f"  cache: {model_cache_dir(args, model_id)}", flush=True)
             print(f"  incomplete files: {len(incomplete_files)}", flush=True)
             print(f"  lock files: {len(lock_files)}", flush=True)
+            if args.ensure and not args.force_download:
+                ok, problems = verify_snapshot(args, model_id)
+                if ok:
+                    print("  ready: using complete local snapshot", flush=True)
+                    continue
+                print(f"  local snapshot needs preparation: {'; '.join(problems)}", flush=True)
             if should_clean_incomplete and incomplete_files:
                 remove_paths(incomplete_files, "incomplete files")
             if args.clean_locks and lock_files:

@@ -20,6 +20,13 @@ export SERVER_PORT="$PORT"
 
 mkdir -p "$LOG_DIR"
 
+if [[ "${CHAT_MODEL_AUTO_PREPARE:-1}" == "1" ]]; then
+  echo "Ensuring local model snapshot: $MODEL_ID"
+  "$PYTHON_BIN" download_hf_models.py \
+    --model-id "$MODEL_ID" \
+    --ensure
+fi
+
 exec "$PYTHON_BIN" -m torch.distributed.run \
   --standalone \
   --log-dir "$LOG_DIR" \
