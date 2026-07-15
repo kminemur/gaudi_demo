@@ -66,6 +66,10 @@ directory by default.
 
 Then open `http://<server-ip>:8000/`.
 
+Do not set `MODEL_ID=Qwen/Qwen3-235B-A22B` for this command. That checkpoint
+does not fit the simple single-HPU Transformers path. It needs a separate
+multi-process tensor-parallel serving backend.
+
 You can override the default with `SERVER_PORT` or `--port`.
 
 The script defaults to 8 Gaudi HPU processes. Override settings with
@@ -101,10 +105,9 @@ pkill -f "chat_server.py --host 0.0.0.0"
 The first screen asks for a user name. Each user gets a separate chat screen and
 history, saved in `chat_history.json`.
 
-The UI can switch between:
-
-- `Qwen/Qwen3-32B`
-- `Qwen/Qwen3-235B-A22B`
+The UI serves `Qwen/Qwen3-32B`. Keeping the model list to checkpoints supported
+by the single-HPU loader prevents an accidental 235B startup or out-of-memory
+failure.
 
 The reasoning strength selector changes the speed/depth tradeoff:
 
@@ -132,11 +135,8 @@ Messages are submitted as asynchronous jobs, so you can continue sending follow-
 prompts while previous generations are queued or running. HPU generation is still
 serialized by the server-side model lock on a single HPU.
 
-When you choose a different model, the server unloads the current model and loads
-the selected one on the next chat request.
-
-The chat server exposes only `Qwen/Qwen3-32B` and `Qwen/Qwen3-235B-A22B` in the
-model selector.
+The model download utility can still prepare `Qwen/Qwen3-235B-A22B` for a
+separate tensor-parallel serving backend.
 
 ## vLLM Gaudi inference
 
@@ -180,9 +180,10 @@ The built-in FastAPI server still uses the Transformers tensor-parallel path.
 Use `vllm_gaudi_infer.py` for the first vLLM Gaudi inference path; the UI server
 can be switched to vLLM after this path is validated on the target model.
 
-The server enables Habana inference settings, int32 token inputs, and KV cache
-explicitly, but the main remaining bottleneck is the single-HPU Transformers
-execution path.
+The server uses int32 token inputs and KV cache explicitly. Habana step markers
+are enabled only with `PT_HPU_LAZY_MODE=1`; eager mode executes operations
+immediately and does not need `mark_step()` or step closures. The main remaining
+bottleneck is the single-HPU Transformers execution path.
 
 ```bash
 HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python chat_server.py \
@@ -258,10 +259,9 @@ HF_HOME=$PWD/hf_cache PT_HPU_WEIGHT_SHARING=0 \
 
 This venv supports Qwen3 models such as `Qwen/Qwen3-32B`.
 
-`Qwen/Qwen3-235B-A22B` is available as a Qwen3 causal LM option. The current demo
-uses a single-HPU Transformers placement, so this checkpoint requires enough HPU
-memory for the full model or a future multi-HPU placement path before it can be
-used reliably.
+`Qwen/Qwen3-235B-A22B` is intentionally not offered by the chat server because
+the current demo uses a single-HPU Transformers placement. Serve that checkpoint
+with a multi-HPU tensor-parallel backend instead.
 
 `Qwen/Qwen3-32B-FP8` is accepted by the CLI, but the current HPU + Optimum Habana
 FP8 path creates an FP8 KV cache while the model produces bf16 key/value states.

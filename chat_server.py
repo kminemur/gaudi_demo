@@ -81,6 +81,26 @@ MODEL_REQUIRED_TYPES = {}
 FP8_CORRECTNESS_FALLBACKS = {}
 
 
+def configure_hpu_inference() -> None:
+    """Enable Habana's lazy-only inference helpers when lazy mode is active."""
+    if HPU_EXECUTION_MODE != "lazy":
+        return
+
+    import habana_frameworks.torch.core as htcore
+
+    htcore.hpu_inference_set_env()
+
+
+def mark_hpu_step() -> None:
+    """Materialize a lazy HPU graph; eager execution needs no step marker."""
+    if HPU_EXECUTION_MODE != "lazy":
+        return
+
+    import habana_frameworks.torch.core as htcore
+
+    htcore.mark_step()
+
+
 def is_model_supported(model_id: str) -> bool:
     required_type = MODEL_REQUIRED_TYPES.get(model_id)
     return required_type is None or transformer_supports_model_type(required_type)
@@ -2920,7 +2940,7 @@ class ChatEngine:
                     self.set_active_hpu_device()
                     with torch.no_grad():
                         generated_output["output_ids"] = self.model.generate(**generation_kwargs)
-                        htcore.mark_step()
+                        mark_hpu_step()
                         torch.hpu.synchronize()
                 except Exception as exc:
                     generation_error["error"] = exc
@@ -3905,7 +3925,7 @@ def create_app(model_id: str, tensor_parallel_size: int = 1) -> FastAPI:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve a web chat UI for Qwen on Gaudi.")
-    parser.add_argument("--model-id", default=os.environ.get("MODEL_ID", DEFAULT_MODEL_ID), choices=sorted(supported_model_specs()))
+    parser.add_argument("--model-id", default=model_id_from_env(), choices=sorted(supported_model_specs()))
     parser.add_argument("--host", default=os.environ.get("SERVER_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument(
