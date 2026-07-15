@@ -121,6 +121,16 @@ def supported_model_specs() -> dict[str, dict[str, str]]:
     return {model_id: spec for model_id, spec in MODEL_SPECS.items() if is_model_supported(model_id)}
 
 
+def model_id_from_env() -> str:
+    """Return a supported MODEL_ID, falling back to the compatible default."""
+    model_id = os.environ.get("MODEL_ID", DEFAULT_MODEL_ID)
+    if model_id in supported_model_specs():
+        return model_id
+
+    print_main(f"Ignoring unsupported MODEL_ID={model_id}; using {DEFAULT_MODEL_ID}.")
+    return DEFAULT_MODEL_ID
+
+
 def get_rank() -> int:
     if dist.is_available() and dist.is_initialized():
         return dist.get_rank()

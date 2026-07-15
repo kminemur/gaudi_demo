@@ -313,9 +313,8 @@ HF_HOME=$PWD/hf_cache PT_HPU_WEIGHT_SHARING=0 \
 
 This venv supports Qwen3 models such as `Qwen/Qwen3-32B`.
 
-`Qwen/Qwen3-235B-A22B` is intentionally not offered by the chat server because
-the current demo uses a single-HPU Transformers placement. Serve that checkpoint
-with a multi-HPU tensor-parallel backend instead.
+The chat server serves `Qwen/Qwen3-235B-A22B` through the multi-HPU Transformers
+tensor-parallel startup described above.
 
 `Qwen/Qwen3-32B-FP8` is accepted by the CLI, but the current HPU + Optimum Habana
 FP8 path creates an FP8 KV cache while the model produces bf16 key/value states.
