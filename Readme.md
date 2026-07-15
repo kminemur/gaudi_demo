@@ -1,11 +1,11 @@
 # Gaudi demo
 
-Run Qwen models on Intel Gaudi HPU. The chat server defaults to
-`Qwen/Qwen3-32B`.
+Run Qwen models on Intel Gaudi HPU. The chat server defaults to the
+tensor-parallel `Qwen/Qwen3-235B-A22B` configuration.
 
 ## Docs
 
-- [AI Agent Specification with Intel Gaudi](docs/ai_agent_gaudi_spec.md)
+- [Documentation index](docs/index.md)
 
 ## Model download script
 
@@ -66,10 +66,6 @@ directory by default.
 
 Then open `http://<server-ip>:8000/`.
 
-Do not set `MODEL_ID=Qwen/Qwen3-235B-A22B` for this command. That checkpoint
-does not fit the simple single-HPU Transformers path. It needs a separate
-multi-process tensor-parallel serving backend.
-
 You can override the default with `SERVER_PORT` or `--port`.
 
 The script defaults to 8 Gaudi HPU processes. Override settings with
@@ -79,14 +75,75 @@ environment variables:
 SERVER_PORT=8080 CHAT_TENSOR_PARALLEL_SIZE=8 ./start_chat_server.sh
 ```
 
+## Use Qwen as the Codex model
+
+The server also exposes an OpenAI-compatible Responses API at
+`POST /v1/responses`. It supports the SSE lifecycle used by Codex and Qwen
+function calls, including the `function_call` / `function_call_output` loop.
+
+Start the server with a shared API key. Omit `GAUDI_CODEX_API_KEY` only on a
+trusted private network where unauthenticated access is acceptable:
+
+```bash
+GAUDI_CODEX_API_KEY=<long-random-secret> \
+./start_chat_server.sh
+```
+
+On the machine running Codex, put the provider in the user-level
+`~/.codex/config.toml`. Provider selection is intentionally not read from a
+project `.codex/config.toml`:
+
+```toml
+[model_providers.gaudi_qwen]
+name = "Gaudi Qwen"
+base_url = "http://<gaudi-server-ip>:8000/v1"
+env_key = "GAUDI_CODEX_API_KEY"
+wire_api = "responses"
+request_max_retries = 1
+stream_max_retries = 1
+stream_idle_timeout_ms = 3600000
+
+[profiles.gaudi_qwen]
+model_provider = "gaudi_qwen"
+model = "Qwen/Qwen3-235B-A22B"
+model_context_window = 32768
+model_reasoning_effort = "none"
+model_supports_reasoning_summaries = false
+```
+
+Export the same key and select the profile:
+
+```bash
+export GAUDI_CODEX_API_KEY=<long-random-secret>
+export NO_PROXY=<gaudi-server-ip>,localhost,127.0.0.1
+codex --profile gaudi_qwen
+```
+
+Check the endpoint before starting Codex:
+
+```bash
+curl -N http://<gaudi-server-ip>:8000/v1/responses \
+  -H "Authorization: Bearer $GAUDI_CODEX_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-235B-A22B",
+    "input": "Return exactly: OK",
+    "stream": true
+  }'
+```
+
+The compatibility layer currently passes Codex client-side function tools to
+Qwen. OpenAI-hosted tools such as hosted web search are not implemented by this
+local server. Codex can still execute its local shell, planning, image-viewing,
+and configured MCP function tools when Qwen requests them.
+
 To keep the server running in the background after closing the terminal, start it
 with `nohup`:
 
 ```bash
 cd /home/test1/kazuki/gaudi_demo
 
-HF_HOME=$PWD/hf_cache nohup /home/test1/habanalabs-venv/bin/python chat_server.py \
-  --host 0.0.0.0 \
+GAUDI_CODEX_API_KEY=<long-random-secret> nohup ./start_chat_server.sh \
   > chat_server.log 2>&1 &
 ```
 
@@ -105,9 +162,9 @@ pkill -f "chat_server.py --host 0.0.0.0"
 The first screen asks for a user name. Each user gets a separate chat screen and
 history, saved in `chat_history.json`.
 
-The UI serves `Qwen/Qwen3-32B`. Keeping the model list to checkpoints supported
-by the single-HPU loader prevents an accidental 235B startup or out-of-memory
-failure.
+The UI defaults to `Qwen/Qwen3-235B-A22B` across 8 Gaudi HPU processes. Set
+`MODEL_ID` and `CHAT_TENSOR_PARALLEL_SIZE` before startup to select another
+supported configuration.
 
 The reasoning strength selector changes the speed/depth tradeoff:
 
@@ -132,11 +189,9 @@ makes a per-message search decision inside the active thread.
 While a message is running, the UI shows agent steps such as web search,
 source preparation, prompt construction, model generation, and completion.
 Messages are submitted as asynchronous jobs, so you can continue sending follow-up
-prompts while previous generations are queued or running. HPU generation is still
-serialized by the server-side model lock on a single HPU.
-
-The model download utility can still prepare `Qwen/Qwen3-235B-A22B` for a
-separate tensor-parallel serving backend.
+prompts while previous generations are queued or running. Generation requests
+are serialized by the server-side model lock and executed by all tensor-parallel
+workers.
 
 ## vLLM Gaudi inference
 
@@ -182,8 +237,7 @@ can be switched to vLLM after this path is validated on the target model.
 
 The server uses int32 token inputs and KV cache explicitly. Habana step markers
 are enabled only with `PT_HPU_LAZY_MODE=1`; eager mode executes operations
-immediately and does not need `mark_step()` or step closures. The main remaining
-bottleneck is the single-HPU Transformers execution path.
+immediately and does not need `mark_step()` or step closures.
 
 ```bash
 HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python chat_server.py \

@@ -30,7 +30,7 @@ import torch.distributed as dist
 import habana_frameworks.torch.core as htcore
 import requests
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from transformers import (
     AutoConfig,
@@ -43,6 +43,17 @@ from transformers import (
     TextIteratorStreamer,
 )
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+from responses_api import (
+    function_tools,
+    make_response,
+    output_items,
+    parse_qwen_output,
+    qwen_messages,
+    sse,
+    stream_events as response_stream_events,
+    tool_name_map,
+)
 
 
 COMPAT_DEFAULT_MODEL_ID = "Qwen/Qwen3-235B-A22B"
@@ -2771,12 +2782,15 @@ class ChatEngine:
             command = command_box[0] or {}
             if command.get("type") == "shutdown":
                 break
-            if command.get("type") != "generate":
-                continue
-            request = ChatRequest(**command["request"])
             with self.lock:
-                self.load(request.model_id)
-                self._generate_loaded(request, sources=[], cancel_event=None)
+                if command.get("type") == "generate":
+                    request = ChatRequest(**command["request"])
+                    self.load(request.model_id)
+                    self._generate_loaded(request, sources=[], cancel_event=None)
+                elif command.get("type") == "responses":
+                    payload = command["payload"]
+                    self.load(str(payload.get("model") or self.default_model_id))
+                    self._generate_responses_loaded(payload)
 
     def _generate_loaded(
         self,
@@ -3006,6 +3020,67 @@ class ChatEngine:
                 generated_tokens=generated_tokens,
             )
             yield {"type": "final", "data": response.model_dump()}
+
+    def generate_responses(self, payload: dict) -> tuple[str, int, int]:
+        """Generate raw Qwen output for the OpenAI-compatible Responses API."""
+        with self.lock:
+            model_id = str(payload.get("model") or self.default_model_id)
+            self.load(model_id)
+            if self.tensor_parallel_size > 1 and is_main_process():
+                self.broadcast_command({"type": "responses", "payload": payload})
+            return self._generate_responses_loaded(payload)
+
+    def _generate_responses_loaded(self, payload: dict) -> tuple[str, int, int]:
+        assert self.model is not None
+        assert self.tokenizer is not None
+
+        messages = qwen_messages(payload)
+        if not messages:
+            raise ValueError("Responses API input must contain at least one text message.")
+        tools = function_tools(payload.get("tools") or [])
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": (payload.get("reasoning") or {}).get("effort") in {"high", "xhigh"},
+        }
+        if tools:
+            template_kwargs["tools"] = tools
+        prompt = self.tokenizer.apply_chat_template(messages, **template_kwargs)
+        inputs = self.tokenize(prompt)
+        if USE_INT32_INPUTS:
+            for key in ("input_ids", "attention_mask"):
+                if key in inputs:
+                    inputs[key] = inputs[key].to(dtype=torch.int32)
+        self.set_active_hpu_device()
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+
+        prompt_tokens = int(inputs["input_ids"].shape[-1])
+        requested_tokens = payload.get("max_output_tokens") or 4096
+        max_output_tokens = max(1, min(int(requested_tokens), 4096))
+        temperature = float(payload.get("temperature") or 0.0)
+        generation_kwargs = {
+            **inputs,
+            "max_new_tokens": max_output_tokens,
+            "do_sample": temperature > 0,
+            "pad_token_id": self.eos_token_id(),
+            "use_cache": True,
+        }
+        if temperature > 0:
+            generation_kwargs["temperature"] = temperature
+            generation_kwargs["top_p"] = float(payload.get("top_p") or 1.0)
+
+        torch.hpu.synchronize()
+        with torch.inference_mode():
+            output_ids = self.model.generate(**generation_kwargs)
+            mark_hpu_step()
+            torch.hpu.synchronize()
+        generated_ids = output_ids[:, prompt_tokens:]
+        output_tokens = int(generated_ids.shape[-1])
+        decoder = self.tokenizer.tokenizer if hasattr(self.tokenizer, "tokenizer") else self.tokenizer
+        raw_text = decoder.batch_decode(generated_ids, skip_special_tokens=False)[0]
+        for special_token in filter(None, (decoder.eos_token, decoder.pad_token)):
+            raw_text = raw_text.replace(special_token, "")
+        return raw_text.strip(), prompt_tokens, output_tokens
 
     def eos_token_id(self) -> int | None:
         assert self.tokenizer is not None
@@ -3427,6 +3502,63 @@ def create_app(model_id: str, tensor_parallel_size: int = 1) -> FastAPI:
             "hpu_current_device": None,
             "loaded_at": engine.loaded_at,
         }
+
+    def authorize_responses(request: Request) -> None:
+        expected = os.environ.get("GAUDI_CODEX_API_KEY")
+        if expected and request.headers.get("authorization") != f"Bearer {expected}":
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+    @app.get("/v1/models")
+    def openai_models(request: Request) -> dict:
+        authorize_responses(request)
+        return {
+            "object": "list",
+            "data": [
+                {"id": model_id, "object": "model", "created": 0, "owned_by": "gaudi-local"}
+                for model_id in supported_model_specs()
+            ],
+        }
+
+    @app.post("/v1/responses")
+    async def openai_responses(request: Request) -> Response:
+        authorize_responses(request)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Responses API request body must be a JSON object.")
+            model_id = str(payload.get("model") or engine.default_model_id)
+            if model_id not in supported_model_specs():
+                raise ValueError(f"Unsupported model: {model_id}")
+            payload["model"] = model_id
+            raw_text, input_tokens, generated_tokens = engine.generate_responses(payload)
+            allowed_tools = tool_name_map(payload.get("tools") or [])
+            text, calls = parse_qwen_output(raw_text, allowed_tools)
+            items = output_items(text, calls)
+            response = make_response(payload, items, input_tokens, generated_tokens)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": str(exc), "type": "invalid_request_error"}},
+            )
+        except Exception as exc:
+            print(f"Responses API error: {exc}", flush=True)
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"message": str(exc), "type": "server_error"}},
+            )
+
+        if not payload.get("stream"):
+            return JSONResponse(response)
+
+        def events():
+            for event in response_stream_events(response):
+                yield sse(event)
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/api/agent_steps/{request_id}")
     def agent_steps(request_id: str) -> dict:
