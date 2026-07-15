@@ -1,11 +1,11 @@
 # vLLM Gaudi LLM server demo
 
 Intel Gaudi 上に、OpenAI 互換の LLM API サーバーを構築する最小デモです。
-[vllm-project/vllm-gaudi](https://github.com/vllm-project/vllm-gaudi) の公式手順に沿って、vLLMとGaudiプラグインの安定版 `v0.24.0` をソースから導入します。
+[vllm-project/vllm-gaudi](https://github.com/vllm-project/vllm-gaudi) の公式手順に沿って、Gaudi環境に対応するvLLMとプラグインをソースから導入します。
 
 ## 必要な環境
 
-- Intel Gaudi Software 1.24.1 と付属の PyTorch 2.11 が導入済みの Linux
+- Intel Gaudi Software 1.24.0以降が導入済みのLinux
 - Python 3、Git、curl
 - モデルにアクセスするための `HF_TOKEN`（必要な場合のみ）
 
@@ -21,7 +21,14 @@ bash setup.sh
 PYTHON=/path/to/venv/bin/python bash setup.sh
 ```
 
-`setup.sh` はHabana用PyTorchを保持し、CUDA版PyTorchが入っている環境では処理を停止します。事前確認:
+`setup.sh` はPyTorchから互換バージョンを自動選択し、Habana用PyTorchを保持します。
+
+| PyTorch | Gaudi Software | vLLM / vLLM Gaudi |
+| --- | --- | --- |
+| 2.10 | 1.24.0 | 0.19.1 |
+| 2.11 | 1.24.1 | 0.24.0 |
+
+CUDA版PyTorchが入っている環境では処理を停止します。事前確認:
 
 ```bash
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c \
@@ -30,7 +37,7 @@ python -c \
   'import torch, habana_frameworks.torch; print(torch.hpu.is_available())'
 ```
 
-期待値はPyTorch `2.11.x`、CUDA `None`、HPU `True` です。CUDA版PyTorchが表示された場合は、その仮想環境をIntel Gaudi Software 1.24.1のインストーラーまたは公式コンテナから作り直してください。PyPIの `torch` だけを再インストールしてもHabanaランタイムとの整合性は戻りません。
+期待値はPyTorch `2.10.x` または `2.11.x`、CUDA `None`、HPU `True` です。CUDA版PyTorchが表示された場合は、その仮想環境をIntel Gaudi Softwareのインストーラーまたは公式コンテナから作り直してください。PyPIの `torch` だけを再インストールしてもHabanaランタイムとの整合性は戻りません。
 
 ## 2. サーバー起動
 
