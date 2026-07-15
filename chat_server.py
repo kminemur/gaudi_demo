@@ -26,7 +26,6 @@ os.environ.setdefault("PT_HPU_LAZY_MODE", "0")
 os.environ.setdefault("PT_HPU_WEIGHT_SHARING", "0")
 
 import torch
-import habana_frameworks.torch.core as htcore
 import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
@@ -68,14 +67,29 @@ MODEL_SPECS = {
         "kind": "causal_lm",
         "precision": "bf16",
     },
-    "Qwen/Qwen3-235B-A22B": {
-        "label": "Qwen3 235B A22B",
-        "kind": "causal_lm",
-        "precision": "bf16",
-    },
 }
 MODEL_REQUIRED_TYPES = {}
 FP8_CORRECTNESS_FALLBACKS = {}
+
+
+def configure_hpu_inference() -> None:
+    """Enable Habana's lazy-only inference helpers when lazy mode is active."""
+    if HPU_EXECUTION_MODE != "lazy":
+        return
+
+    import habana_frameworks.torch.core as htcore
+
+    htcore.hpu_inference_set_env()
+
+
+def mark_hpu_step() -> None:
+    """Materialize a lazy HPU graph; eager execution needs no step marker."""
+    if HPU_EXECUTION_MODE != "lazy":
+        return
+
+    import habana_frameworks.torch.core as htcore
+
+    htcore.mark_step()
 
 
 def is_model_supported(model_id: str) -> bool:
@@ -85,6 +99,18 @@ def is_model_supported(model_id: str) -> bool:
 
 def supported_model_specs() -> dict[str, dict[str, str]]:
     return {model_id: spec for model_id, spec in MODEL_SPECS.items() if is_model_supported(model_id)}
+
+
+def model_id_from_env() -> str:
+    model_id = os.environ.get("MODEL_ID", DEFAULT_MODEL_ID)
+    if model_id in supported_model_specs():
+        return model_id
+
+    print(
+        f"Ignoring unsupported MODEL_ID={model_id}; using {DEFAULT_MODEL_ID}.",
+        flush=True,
+    )
+    return DEFAULT_MODEL_ID
 
 
 def is_fp8_model(model_id: str) -> bool:
@@ -686,7 +712,6 @@ HTML = """<!doctype html>
             <div class="option-controls">
               <select id="model" name="model_id" aria-label="model">
                 <option value="Qwen/Qwen3-32B" selected>Qwen3 32B</option>
-                <option value="Qwen/Qwen3-235B-A22B">Qwen3 235B A22B</option>
               </select>
               <select id="reasoning" name="reasoning_effort" aria-label="reasoning strength">
                 <option value="low">Low</option>
@@ -2184,7 +2209,7 @@ class ChatEngine:
             raise RuntimeError("HPU is not available. Check Habana driver/runtime setup.")
 
         self.unload()
-        htcore.hpu_inference_set_env()
+        configure_hpu_inference()
         optimum_enabled = enable_optimum_habana()
         spec = MODEL_SPECS[model_id]
         execution_model_id = resolve_execution_model_id(model_id)
@@ -2217,7 +2242,7 @@ class ChatEngine:
         self.tokenizer = tokenizer
         self.active_model_id = model_id
         self.model_kind = spec["kind"]
-        htcore.mark_step()
+        mark_hpu_step()
         torch.hpu.synchronize()
         self.precision = (
             f"bf16 fallback from {model_id}" if execution_model_id != model_id else spec["precision"]
@@ -2319,7 +2344,7 @@ class ChatEngine:
             stopping_criteria.start()
             with torch.inference_mode():
                 output_ids = self.model.generate(**generation_kwargs)
-                htcore.mark_step()
+                mark_hpu_step()
                 torch.hpu.synchronize()
 
             if cancel_event and cancel_event.is_set():
@@ -2404,7 +2429,7 @@ class ChatEngine:
                 try:
                     with torch.inference_mode():
                         generated_output["output_ids"] = self.model.generate(**generation_kwargs)
-                        htcore.mark_step()
+                        mark_hpu_step()
                         torch.hpu.synchronize()
                 except Exception as exc:
                     generation_error["error"] = exc
@@ -3422,15 +3447,12 @@ def create_app(model_id: str) -> FastAPI:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve a web chat UI for Qwen on Gaudi.")
-    parser.add_argument("--model-id", default=os.environ.get("MODEL_ID", DEFAULT_MODEL_ID), choices=sorted(supported_model_specs()))
+    parser.add_argument("--model-id", default=model_id_from_env(), choices=sorted(supported_model_specs()))
     parser.add_argument("--host", default=os.environ.get("SERVER_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=None)
     args = parser.parse_args()
     args.port = args.port or int(os.environ.get("SERVER_PORT", DEFAULT_SERVER_PORT))
     return args
-
-
-app = create_app(os.environ.get("MODEL_ID", DEFAULT_MODEL_ID))
 
 
 if __name__ == "__main__":
@@ -3441,3 +3463,5 @@ if __name__ == "__main__":
     SERVER_PORT = args.port
     app = create_app(args.model_id)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+else:
+    app = create_app(model_id_from_env())
