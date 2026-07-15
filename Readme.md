@@ -9,38 +9,60 @@ Run Qwen models on Intel Gaudi HPU. The chat server defaults to
 
 ## Model download script
 
-Use the dedicated script to pre-download model snapshots into Hugging Face cache.
+Use the dedicated script to pre-download and verify model snapshots before
+starting the chat server. This keeps the UI from appearing stuck while large
+model shards are still being fetched. If `HF_HOME` is not set, the script uses
+this repository's `./hf_cache` directory by default.
 
-Download all demo default models:
+Prepare all demo default models:
 
 ```bash
-HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python download_hf_models.py --all-defaults
+/home/test1/habanalabs-venv-optimum/bin/python download_hf_models.py \
+  --all-defaults \
+  --prepare
 ```
 
-Download specific models only:
+Prepare specific models only:
 
 ```bash
-HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python download_hf_models.py \
+/home/test1/habanalabs-venv-optimum/bin/python download_hf_models.py \
   --model-id Qwen/Qwen3-32B \
-  --model-id Qwen/Qwen3-235B-A22B
+  --model-id Qwen/Qwen3-235B-A22B \
+  --prepare
 ```
 
 If authentication is required, set a token:
 
 ```bash
-HF_TOKEN=<your_token> HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python download_hf_models.py \
-  --model-id Qwen/Qwen3-235B-A22B
+HF_TOKEN=<your_token> /home/test1/habanalabs-venv-optimum/bin/python download_hf_models.py \
+  --model-id Qwen/Qwen3-235B-A22B \
+  --prepare
+```
+
+If a previous download was interrupted, `--prepare` removes stale
+`*.incomplete` blob files for the selected models and verifies the final local
+snapshot. To check the cache without downloading:
+
+```bash
+/home/test1/habanalabs-venv-optimum/bin/python download_hf_models.py \
+  --all-defaults \
+  --verify-only
 ```
 
 ## Chat UI
 
-Start a web chat server bound to all interfaces. The server uses port `8000` by
-default and loads the single-HPU `Qwen/Qwen3-32B` model on the first request:
+Start the 235B tensor-parallel chat server bound to all interfaces. The server
+uses port `8000` by default:
 
 ```bash
-HF_HOME=$PWD/hf_cache /home/test1/habanalabs-venv/bin/python chat_server.py \
-  --host 0.0.0.0
+./start_chat_server.sh
 ```
+
+By default, `chat_server.py` loads models from the already-downloaded local
+Hugging Face snapshot and does not download missing files at startup. To allow
+the server to download from Hugging Face, set `CHAT_MODEL_LOCAL_FILES_ONLY=0`.
+If `HF_HOME` is not set, the server also uses this repository's `./hf_cache`
+directory by default.
 
 Then open `http://<server-ip>:8000/`.
 
@@ -49,6 +71,13 @@ does not fit the simple single-HPU Transformers path. It needs a separate
 multi-process tensor-parallel serving backend.
 
 You can override the default with `SERVER_PORT` or `--port`.
+
+The script defaults to 8 Gaudi HPU processes. Override settings with
+environment variables:
+
+```bash
+SERVER_PORT=8080 CHAT_TENSOR_PARALLEL_SIZE=8 ./start_chat_server.sh
+```
 
 To keep the server running in the background after closing the terminal, start it
 with `nohup`:
@@ -109,11 +138,47 @@ serialized by the server-side model lock on a single HPU.
 The model download utility can still prepare `Qwen/Qwen3-235B-A22B` for a
 separate tensor-parallel serving backend.
 
+## vLLM Gaudi inference
+
+Build vLLM and the Intel Gaudi hardware plugin from source. The script follows
+the `vllm-project/vllm-gaudi` flow: it resolves the plugin's last verified vLLM
+commit, installs vLLM with `VLLM_TARGET_DEVICE=empty`, then installs
+`vllm-gaudi`.
+
+```bash
+PYTHON_BIN=/home/test1/habanalabs-venv/bin/python ./scripts/build_vllm_gaudi.sh
+```
+
+Start the CLI chat bot with a selected model. The model is loaded once, then
+each chat turn prints TTFT and TPS metrics:
+
+```bash
+MODEL_ID=Qwen/Qwen3-235B-A22B \
+VLLM_TP_SIZE=8 \
+./start_vllm_gaudi_infer.sh
+```
+
+Inside the chat, use `/reset` to clear history and `/exit` to quit. To run a
+single prompt and exit, pass `--once`:
+
+```bash
+MODEL_ID=Qwen/Qwen3-32B \
+PROMPT="日本語で短く自己紹介して" \
+./start_vllm_gaudi_infer.sh --once
+```
+
+The vLLM CLI defaults to local Hugging Face snapshots under `./hf_cache`. To let
+vLLM download missing model files, pass `--no-local-files-only`:
+
+```bash
+MODEL_ID=Qwen/Qwen3-32B ./start_vllm_gaudi_infer.sh --no-local-files-only
+```
+
 ## Performance notes
 
-The built-in FastAPI server uses Transformers directly on a single HPU. On an
-8-card Gaudi2 host this leaves the other HPUs idle; use vLLM for Intel Gaudi or
-DeepSpeed/Optimum Habana tensor parallel inference for production throughput.
+The built-in FastAPI server still uses the Transformers tensor-parallel path.
+Use `vllm_gaudi_infer.py` for the first vLLM Gaudi inference path; the UI server
+can be switched to vLLM after this path is validated on the target model.
 
 The server uses int32 token inputs and KV cache explicitly. Habana step markers
 are enabled only with `PT_HPU_LAZY_MODE=1`; eager mode executes operations
