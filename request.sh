@@ -2,7 +2,7 @@
 set -euo pipefail
 
 URL="${URL:-http://localhost:8000}"
-MODEL="${MODEL:-Qwen/Qwen3-235B-A22B}"
+MODEL="${MODEL:-Qwen/Qwen3-Coder-Next-FP8}"
 HEADERS=(-H 'Content-Type: application/json')
 test -z "${API_KEY:-}" || HEADERS+=(-H "Authorization: Bearer $API_KEY")
 
