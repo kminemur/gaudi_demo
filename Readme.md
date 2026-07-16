@@ -46,17 +46,16 @@ python -c \
 bash serve.sh
 ```
 
-既定値は `Qwen/Qwen3-235B-A22B`、8 HPU、ポート `8000` です。
+既定値は `Qwen/Qwen3-Coder-Next-FP8`、4 HPU、最大コンテキスト長
+`262144`、ポート `8000` です。
 
 ```bash
-MODEL=Qwen/Qwen3-235B-A22B TP_SIZE=8 bash serve.sh
+MODEL=Qwen/Qwen3-Coder-Next-FP8 TP_SIZE=4 bash serve.sh
 ```
 
-Qwen3-Coder-Nextを起動する場合:
-
-```bash
-MODEL=Qwen/Qwen3-Coder-Next TP_SIZE=8 MAX_MODEL_LEN=4096 bash serve.sh
-```
+このFP8モデルの量子化ブロック幅は128、共有エキスパート幅は512のため、
+`TP_SIZE` には `1`、`2`、`4` のいずれかを指定してください。`8` は各ランクの
+入力幅が64となり、モデルのロードに失敗します。
 
 主な設定は `MODEL`、`TP_SIZE`、`MAX_MODEL_LEN`、`HOST`、`PORT`、`API_KEY` です。
 
