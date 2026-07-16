@@ -13,9 +13,12 @@ print(re.match(r"\d+\.\d+\.\d+", torch.__version__).group())
 "$PYTHON" -c 'import torch, habana_frameworks.torch; assert torch.hpu.is_available()'
 
 case "$TORCH_VERSION" in
-  2.10.*) DEFAULT_VERSION=v0.19.1 ;;
   2.11.*) DEFAULT_VERSION=v0.24.0 ;;
-  *) echo "Unsupported PyTorch: $TORCH_VERSION" >&2; exit 1 ;;
+  *)
+    echo "Unsupported PyTorch: $TORCH_VERSION" >&2
+    echo "Intel Gaudi Software 1.24.1 with PyTorch 2.11 is required." >&2
+    exit 1
+    ;;
 esac
 VERSION="${VERSION:-$DEFAULT_VERSION}"
 echo "Using vLLM Gaudi $VERSION with PyTorch $TORCH_VERSION"
@@ -32,10 +35,12 @@ cd "$DEPS"
 test -d vllm-gaudi || git clone https://github.com/vllm-project/vllm-gaudi
 git -C vllm-gaudi fetch --tags
 git -C vllm-gaudi checkout "$VERSION"
+VLLM_COMMIT=$(tr -d '[:space:]' < vllm-gaudi/VLLM_STABLE_COMMIT)
+test -n "$VLLM_COMMIT" || { echo "VLLM_STABLE_COMMIT is empty" >&2; exit 1; }
 
 test -d vllm || git clone https://github.com/vllm-project/vllm
-git -C vllm fetch --tags
-git -C vllm checkout "$VERSION"
+git -C vllm fetch origin "$VLLM_COMMIT"
+git -C vllm checkout "$VLLM_COMMIT"
 
 "$PYTHON" -m pip install -r <(sed '/^torch/d' vllm/requirements/build/cuda.txt)
 "$PYTHON" -m pip install -r vllm/requirements/common.txt
